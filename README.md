@@ -1,7 +1,7 @@
 # MTunnel License Server
 
 Server xác thực bản quyền cho app MTunnel Android.  
-Hỗ trợ **SSE (Server-Sent Events)** — server push lệnh `revoke`, `extend`, `update_config` xuống app theo thời gian thực mà không tốn tài nguyên.
+Hỗ trợ **SSE (Server-Sent Events)** — khi admin đổi token, tất cả app nhận lệnh `revoke` và bị kill ngay lập tức.
 
 ## Cài đặt nhanh (1 lệnh)
 
@@ -21,101 +21,52 @@ Script tự động:
 - Domain đã trỏ A record về IP server
 - Cổng 80 và 443 mở
 
-## Đổi token sau khi cài
+## Cách hoạt động
+
+```
+App khởi động
+  │
+  ├─► POST /api/verify   → xác thực token, nhận expire_at
+  │
+  └─► GET  /api/events   → giữ kết nối SSE (daemon thread)
+            │
+            ◄── : ping               (heartbeat 25s)
+            ◄── data: {"action":"revoke"}   ← khi admin đổi token
+```
+
+Khi admin chạy `mtunnel-token` để đổi token mới:
+- Server detect thay đổi trong vòng 2 giây
+- Push `revoke` tới **tất cả app** đang kết nối
+- App bị kill ngay lập tức
+- App dùng token mới vẫn hoạt động bình thường
+
+## Thu hồi toàn bộ app
 
 ```bash
 mtunnel-token
+# Nhập token mới → tất cả app bị kill ngay
 ```
 
 ## Lệnh quản lý
 
 ```bash
-# Xem trạng thái
-systemctl status mtunnel-license
+# Đổi token (thu hồi tất cả app ngay lập tức)
+mtunnel-token
+
+# Xem trạng thái + số app đang kết nối SSE
+curl https://your-domain.com/health
 
 # Xem log realtime
 journalctl -u mtunnel-license -f
 
 # Restart service
 systemctl restart mtunnel-license
-
-# Kiểm tra server + số app đang kết nối SSE
-curl https://your-domain.com/health
 ```
 
 ## Endpoints
 
 | Method | Path | Mô tả |
 |--------|------|--------|
-| POST | `/api/verify` | App gọi khi khởi động để xác thực license |
-| GET  | `/api/events` | App giữ kết nối SSE để nhận push từ server |
-| POST | `/api/admin/revoke` | Admin thu hồi license → app bị kill ngay |
-| POST | `/api/admin/extend` | Admin gia hạn license |
-| POST | `/api/admin/config` | Admin push config mới (URL, ...) |
-| GET  | `/health` | Kiểm tra trạng thái server |
-
-## Admin API
-
-Tất cả admin API dùng `admin_key` = server token (xem trong `/opt/mtunnel/.token`).
-
-### Thu hồi license (kill app ngay)
-
-```bash
-# Revoke 1 app cụ thể
-curl -X POST https://your-domain.com/api/admin/revoke \
-  -H "Content-Type: application/json" \
-  -d '{"admin_key":"TOKEN_SERVER","token":"TOKEN_APP"}'
-
-# Revoke tất cả app đang kết nối
-curl -X POST https://your-domain.com/api/admin/revoke \
-  -H "Content-Type: application/json" \
-  -d '{"admin_key":"TOKEN_SERVER","token":""}'
-```
-
-### Gia hạn license
-
-```bash
-curl -X POST https://your-domain.com/api/admin/extend \
-  -H "Content-Type: application/json" \
-  -d '{"admin_key":"TOKEN_SERVER","token":"TOKEN_APP","seconds":86400}'
-```
-
-### Push config mới
-
-```bash
-curl -X POST https://your-domain.com/api/admin/config \
-  -H "Content-Type: application/json" \
-  -d '{"admin_key":"TOKEN_SERVER","config":{"verify_url":"https://new-domain.com/api/verify"}}'
-```
-
-## Cập nhật app Android
-
-Sau khi cài, cập nhật `getVerifyUrl()` trong native layer trỏ về:
-
-```
-https://your-domain.com/api/verify
-```
-
-SSE endpoint (app tự build từ verify URL):
-
-```
-https://your-domain.com/api/events
-```
-
-## Kiến trúc SSE
-
-```
-App khởi động
-  │
-  ├─► POST /api/verify        → xác thực, nhận expire_at
-  │
-  └─► GET  /api/events        → giữ kết nối (daemon thread)
-          │
-          ◄── : ping           (heartbeat 25s, giữ NAT)
-          ◄── data: {"action":"revoke"}
-          ◄── data: {"action":"extend","expire_at":...}
-          ◄── data: {"action":"update_config","config":...}
-```
-
-Kết nối SSE idle gần như không tốn CPU/pin — chỉ 1 TCP connection duy trì.  
-Tự reconnect với exponential backoff (5s → 10s → ... → 5 phút) khi mất mạng.
+| POST | `/api/verify` | App gọi khi khởi động để xác thực |
+| GET  | `/api/events` | App giữ kết nối SSE để nhận push |
+| GET  | `/health` | Trạng thái server + số kết nối SSE |
