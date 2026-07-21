@@ -67,10 +67,23 @@ read -s GH_TOKEN
 echo ""
 echo ""
 
+# ── Nhập Cloudflare API Token (dùng cho xin SSL qua DNS-01) ─
+# DNS-01 challenge duoc dung thay vi HTTP-01 vi khong can port 80,
+# tranh xung dot voi cac service khac (vd psiphond) da chiem port 80/443.
+echo -e "${CYAN}${BOLD}--- Cloudflare API Token (de xin SSL, khong can port 80) ---${NC}"
+echo -e "${YELLOW}Tao tai: https://dash.cloudflare.com/profile/api-tokens${NC}"
+echo -e "${YELLOW}Dung template 'Edit zone DNS', gioi han vao đúng zone cua domain ban dung${NC}"
+echo ""
+printf "${CYAN}Cloudflare API Token${NC} (an khi go): "
+read -s CF_TOKEN
+echo ""
+[ -z "$CF_TOKEN" ] && error "Can Cloudflare API Token de xin SSL qua DNS-01 (khong the dung port 80/443)"
+echo ""
+
 # ── 1. Cài packages ─────────────────────────────────────────
 log "Cai dat dependencies..."
 apt update -qq
-apt install -y python3-pip nginx certbot python3-certbot-nginx curl > /dev/null 2>&1
+apt install -y python3-pip nginx certbot python3-certbot-dns-cloudflare curl > /dev/null 2>&1
 pip3 install flask gunicorn gevent cryptography -q
 log "Dependencies da cai xong"
 
@@ -255,18 +268,9 @@ else
     PINNED_PUBKEY_SHA256="(chua co - chay 'mtunnel-pubkey' sau)"
 fi
 
-# ── 7a. Do cong SSL TRUOC khi tao config nginx ────────────────
-# QUAN TRONG: certbot --nginx (che do full-auto, dung o ban cu) se tu
-# dong them "listen 443 ssl" vao config va tu reload nginx. Neu port 443
-# tren VPS da bi mot service KHAC (vd psiphond, mot VPN server rieng)
-# chiem dung, buoc reload do se that bai (Address already in use),
-# certbot tra ve exit code loi, va vi script chay voi "set -e" o dau
-# file, TOAN BO SCRIPT SE DUNG NGAY TAI DAY - khong bao gio toi duoc
-# buoc doi sang port thay the. Day la nguyen nhan panel loi khi cai dat.
-#
-# Fix: tu do cong 443 (va cong thay the neu can) TRUOC, chi dung certbot
-# de XIN CHUNG CHI (certonly), khong cho certbot tu dong sua/deploy vao
-# nginx. Sau do tu viet block SSL voi dung cong da xac dinh.
+# ── 7a. Do cong SSL (port 80/443 co the da bi service khac nhu ────
+#        psiphond chiem dung tren ca 2 port, nen dung DNS-01 challenge
+#        thay vi HTTP-01 — khong can port 80 nua)
 is_port_free() {
     # Tra ve 0 (true) neu khong co process nao dang LISTEN tren port $1
     ! ss -Htln "( sport = :$1 )" 2>/dev/null | grep -q .
@@ -285,36 +289,32 @@ else
     log "Se dung port $SSL_PORT cho HTTPS thay vi 443"
 fi
 
-# ── 7b. Nginx (HTTP only truoc, dung cho ACME http-01 challenge) ──
-# Luu y: certbot --nginx (chay o buoc 8a) se tu chen tam mot location
-# ACME challenge vao block port 80 nay trong luc xin cert, roi tu don
-# dep lai - nen viec block 80 la redirect ngay tu dau khong anh huong.
-log "Cau hinh Nginx..."
-cat > /etc/nginx/sites-available/mtunnel << NGXEOF
-server {
-    listen 80;
-    server_name $DOMAIN;
+# ── 7b. Luu Cloudflare credentials cho certbot dns plugin ────
+mkdir -p /root/.secrets/certbot
+cat > /root/.secrets/certbot/cloudflare.ini << CFEOF
+dns_cloudflare_api_token = $CF_TOKEN
+CFEOF
+chmod 600 /root/.secrets/certbot/cloudflare.ini
 
-    location / {
-        return 301 https://\$host:$SSL_PORT\$request_uri;
-    }
-}
-NGXEOF
-
-ln -sf /etc/nginx/sites-available/mtunnel /etc/nginx/sites-enabled/mtunnel
-nginx -t > /dev/null 2>&1 && systemctl reload nginx
-log "Nginx da cau hinh (HTTP)"
-
-# ── 8a. Xin chung chi SSL (khong deploy tu dong vao nginx) ───
-log "Xin SSL certificate cho $DOMAIN..."
-if ! certbot certonly --nginx -d "$DOMAIN" --email "$EMAIL" --agree-tos --non-interactive > /tmp/certbot.log 2>&1; then
-    error "Cap SSL that bai. Chi tiet: xem /tmp/certbot.log (thuong do DNS cua $DOMAIN chua tro ve VPS nay, hoac port 80 cung dang bi chiem)"
+# ── 8a. Xin chung chi SSL qua DNS-01 (khong can port 80/443) ─
+# Vi psiphond dang chiem dung ca port 80 va co the ca 443, HTTP-01
+# challenge (can port 80 mo) khong the dung duoc. DNS-01 challenge
+# xac thuc qua ban ghi TXT tren Cloudflare, hoan toan khong dung
+# den port 80/443 cua may chu, nen tranh duoc xung dot nay.
+log "Xin SSL certificate cho $DOMAIN (DNS-01 qua Cloudflare)..."
+if ! certbot certonly --dns-cloudflare \
+    --dns-cloudflare-credentials /root/.secrets/certbot/cloudflare.ini \
+    --dns-cloudflare-propagation-seconds 30 \
+    -d "$DOMAIN" --email "$EMAIL" --agree-tos --non-interactive > /tmp/certbot.log 2>&1; then
+    error "Cap SSL that bai. Chi tiet: cat /tmp/certbot.log (thuong do Cloudflare API Token sai quyen, hoac domain $DOMAIN khong nam trong zone Cloudflare cua token nay)"
 fi
 log "SSL da cap xong"
 
-# ── 8b. Tu viet block SSL voi dung cong da xac dinh ──────────
-cat >> /etc/nginx/sites-available/mtunnel << NGXEOF
-
+# ── 8b. Cau hinh Nginx — chi 1 server block HTTPS tren SSL_PORT ─
+# Khong tao block "listen 80" vi port 80 dang bi service khac (vd
+# psiphond) chiem, nginx se khong the bind duoc port do.
+log "Cau hinh Nginx..."
+cat > /etc/nginx/sites-available/mtunnel << NGXEOF
 server {
     listen $SSL_PORT ssl;
     listen [::]:$SSL_PORT ssl;
@@ -350,16 +350,33 @@ server {
 }
 NGXEOF
 
+ln -sf /etc/nginx/sites-available/mtunnel /etc/nginx/sites-enabled/mtunnel
+rm -f /etc/nginx/sites-enabled/default
+
 if command -v ufw > /dev/null 2>&1 && ufw status | grep -q "Status: active"; then
     ufw allow "$SSL_PORT"/tcp > /dev/null 2>&1
     log "Da mo port $SSL_PORT tren ufw"
 fi
 
 if ! nginx -t > /tmp/nginx-test.log 2>&1; then
-    error "Nginx config loi sau khi them SSL block. Chi tiet: $(cat /tmp/nginx-test.log)"
+    error "Nginx config loi. Chi tiet: $(cat /tmp/nginx-test.log)"
 fi
-systemctl reload nginx
+
+# Dung "restart" thay vi "reload" vi nginx co the dang o trang thai
+# inactive/chua tung chay (vd do port 80 mac dinh bi chiem tu truoc),
+# "reload" se khong lam gi neu service dang khong active.
+systemctl restart nginx
+if ! systemctl is-active --quiet nginx; then
+    error "Nginx khong khoi dong duoc. Kiem tra: journalctl -xeu nginx --no-pager | tail -30"
+fi
 log "Nginx da chay HTTPS tren port $SSL_PORT"
+
+# ── 8c. Auto-renew: certbot renew se tu dung lai dns-cloudflare
+#        plugin (da luu trong renewal config), khong can lam gi them.
+#        Chi can dam bao nginx reload sau khi renew thanh cong:
+if [ -f /etc/letsencrypt/renewal/$DOMAIN.conf ] && ! grep -q "renew_hook" /etc/letsencrypt/renewal/$DOMAIN.conf; then
+    echo "renew_hook = systemctl reload nginx" >> /etc/letsencrypt/renewal/$DOMAIN.conf
+fi
 
 # ── 9. Mở giao diện thiết lập token ────────────────────────
 echo ""
