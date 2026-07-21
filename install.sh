@@ -52,7 +52,7 @@ echo ""
 log "Cai dat dependencies..."
 apt update -qq
 apt install -y python3-pip nginx certbot python3-certbot-nginx curl > /dev/null 2>&1
-pip3 install flask gunicorn gevent cryptography -q
+pip3 install flask gunicorn gevent -q
 log "Dependencies da cai xong"
 
 # ── 2. Tạo thư mục ──────────────────────────────────────────
@@ -214,6 +214,24 @@ log "Cap SSL certificate..."
 certbot --nginx -d "$DOMAIN" --email "$EMAIL" --agree-tos --non-interactive --redirect > /dev/null 2>&1
 log "SSL da cap xong"
 
+# ── 8b. Doi port 443 -> 8443 ─────────────────────────────────
+# QUAN TRONG: port 443 tren VPS nay da bi psiphond chiem dung (VPN server
+# rieng, khong lien quan license server). Certbot mac dinh luon gan
+# "listen 443 ssl" khi chay xong, nen phai sed doi lai NGAY SAU certbot -
+# neu chay certbot lai sau nay (renew --force-renewal, hay certonly moi)
+# co the ghi de mat dong sed nay, can kiem tra lai.
+log "Doi port 443 -> 8443 (tranh xung dot voi psiphond)..."
+sed -i 's/listen 443 ssl;/listen 8443 ssl;/' /etc/nginx/sites-available/mtunnel
+sed -i 's/listen \[::\]:443 ssl;/listen [::]:8443 ssl;/' /etc/nginx/sites-available/mtunnel
+
+if command -v ufw > /dev/null 2>&1 && ufw status | grep -q "Status: active"; then
+    ufw allow 8443/tcp > /dev/null 2>&1
+    log "Da mo port 8443 tren ufw"
+fi
+
+nginx -t > /dev/null 2>&1 && systemctl reload nginx
+log "Da doi sang port 8443"
+
 # ── 9. Mở giao diện thiết lập token ────────────────────────
 echo ""
 echo -e "${YELLOW}${BOLD}═══════════════════════════════════════════${NC}"
@@ -227,24 +245,25 @@ echo -e "${GREEN}${BOLD}══════════════════�
 echo -e "${GREEN}${BOLD}   Cai dat hoan tat!                       ${NC}"
 echo -e "${GREEN}${BOLD}═══════════════════════════════════════════${NC}"
 echo ""
-echo -e "  🌐 Verify URL : ${BOLD}https://$DOMAIN/api/verify${NC}"
-echo -e "  📡 SSE URL    : ${BOLD}https://$DOMAIN/api/events${NC}"
+echo -e "  🌐 Verify URL : ${BOLD}https://$DOMAIN:8443/api/verify${NC}"
+echo -e "  ⚙️  Config URL : ${BOLD}https://$DOMAIN:8443/api/config${NC}"
+echo -e "  📡 SSE URL    : ${BOLD}https://$DOMAIN:8443/api/events${NC}"
 echo -e "  📦 Package    : ${BOLD}$PACKAGE${NC}"
 echo ""
 echo -e "${CYAN}Lenh quan ly:${NC}"
 echo -e "  📋 Xem log    : journalctl -u mtunnel-license -f"
 echo -e "  🔑 Doi token  : mtunnel-token"
 echo -e "  🔄 Restart    : systemctl restart mtunnel-license"
-echo -e "  📊 Status SSE : curl https://$DOMAIN/health"
+echo -e "  📊 Status SSE : curl https://$DOMAIN:8443/health"
 echo ""
 echo -e "${CYAN}Admin API (dung server token lam admin_key):${NC}"
 echo -e "  Thu hoi license:"
-echo -e "  ${BOLD}curl -X POST https://$DOMAIN/api/admin/revoke \\${NC}"
+echo -e "  ${BOLD}curl -X POST https://$DOMAIN:8443/api/admin/revoke \\${NC}"
 echo -e "  ${BOLD}  -H 'Content-Type: application/json' \\${NC}"
 echo -e "  ${BOLD}  -d '{"admin_key":"TOKEN","token":"TOKEN_APP"}'${NC}"
 echo ""
 echo -e "  Revoke tat ca app:"
-echo -e "  ${BOLD}curl -X POST https://$DOMAIN/api/admin/revoke \\${NC}"
+echo -e "  ${BOLD}curl -X POST https://$DOMAIN:8443/api/admin/revoke \\${NC}"
 echo -e "  ${BOLD}  -H 'Content-Type: application/json' \\${NC}"
 echo -e "  ${BOLD}  -d '{"admin_key":"TOKEN","token":""}'${NC}"
 echo ""
