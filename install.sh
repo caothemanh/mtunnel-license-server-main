@@ -52,7 +52,7 @@ echo ""
 log "Cai dat dependencies..."
 apt update -qq
 apt install -y python3-pip nginx certbot python3-certbot-nginx curl > /dev/null 2>&1
-pip3 install flask gunicorn gevent -q
+pip3 install flask gunicorn gevent cryptography -q
 log "Dependencies da cai xong"
 
 # ── 2. Tạo thư mục ──────────────────────────────────────────
