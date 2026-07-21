@@ -62,9 +62,6 @@ def _watch_token():
         except Exception as e:
             app.logger.error(f"[watcher] error: {e}")
 
-_watcher = threading.Thread(target=_watch_token, daemon=True, name="token-watcher")
-_watcher.start()
-
 def _read_token():
     try:
         with open(TOKEN_FILE, "r") as f:
@@ -197,6 +194,12 @@ def _get_or_create_signing_key():
     return key
 
 SIGNING_KEY = _get_or_create_signing_key()
+
+# Khởi động watcher thread SAU KHI mọi hàm nó cần (_read_token, _sse_push_all)
+# đã được định nghĩa xong — đặt ở đây (cuối module, trước khi route chạy)
+# để tránh NameError do thread chạy trước khi Python nạp xong các def phía dưới.
+_watcher = threading.Thread(target=_watch_token, daemon=True, name="token-watcher")
+_watcher.start()
 
 @app.route("/api/verify", methods=["POST"])
 def verify():
