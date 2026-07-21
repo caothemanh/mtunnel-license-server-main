@@ -48,11 +48,30 @@ echo ""
 info "Token se duoc thiet lap sau khi cai dat xong"
 echo ""
 
+# ── Nhập cấu hình GitHub cho /api/config (tùy chọn) ─────────
+echo -e "${CYAN}${BOLD}--- Dong bo file config tu GitHub (tuy chon) ---${NC}"
+echo -e "${YELLOW}Dung cho endpoint /api/config. Bo trong neu chua dung, co the thiet lap sau${NC}"
+echo -e "${YELLOW}bang cach tao thu cong 2 file .github_repo va .github_token trong $INSTALL_DIR${NC}"
+echo ""
+printf "${CYAN}GitHub owner${NC} [vd: caothemanh]: "
+read GH_OWNER
+printf "${CYAN}GitHub repo${NC} [vd: mtunnel-config]: "
+read GH_REPO
+printf "${CYAN}Branch${NC} [main]: "
+read GH_BRANCH
+GH_BRANCH=${GH_BRANCH:-main}
+printf "${CYAN}Duong dan file trong repo${NC} [vd: config.enc]: "
+read GH_PATH
+printf "${CYAN}GitHub Personal Access Token (PAT, an khi go)${NC}: "
+read -s GH_TOKEN
+echo ""
+echo ""
+
 # ── 1. Cài packages ─────────────────────────────────────────
 log "Cai dat dependencies..."
 apt update -qq
 apt install -y python3-pip nginx certbot python3-certbot-nginx curl > /dev/null 2>&1
-pip3 install flask gunicorn gevent -q
+pip3 install flask gunicorn gevent cryptography -q
 log "Dependencies da cai xong"
 
 # ── 2. Tạo thư mục ──────────────────────────────────────────
@@ -65,6 +84,27 @@ PACKAGE=$PACKAGE
 CFGEOF
 chmod 600 "$CONFIG_FILE"
 log "Config da luu"
+
+# ── 3b. Lưu cấu hình GitHub (nếu người dùng đã nhập) ────────
+if [ -n "$GH_OWNER" ] && [ -n "$GH_REPO" ] && [ -n "$GH_PATH" ] && [ -n "$GH_TOKEN" ]; then
+    cat > "$INSTALL_DIR/.github_repo" << GHEOF
+OWNER=$GH_OWNER
+REPO=$GH_REPO
+BRANCH=$GH_BRANCH
+PATH=$GH_PATH
+GHEOF
+    chmod 600 "$INSTALL_DIR/.github_repo"
+
+    echo "$GH_TOKEN" > "$INSTALL_DIR/.github_token"
+    chmod 600 "$INSTALL_DIR/.github_token"
+
+    log "Da luu cau hinh GitHub (owner=$GH_OWNER repo=$GH_REPO branch=$GH_BRANCH)"
+else
+    warn "Bo qua cau hinh GitHub — /api/config se tra loi 500 (config_unavailable)"
+    warn "cho toi khi ban tao thu cong:"
+    warn "  $INSTALL_DIR/.github_repo   (OWNER=... / REPO=... / BRANCH=... / PATH=...)"
+    warn "  $INSTALL_DIR/.github_token  (Personal Access Token)"
+fi
 
 # ── 4. Download server.py từ GitHub ────────────────────────
 log "Download server.py..."
@@ -168,6 +208,53 @@ systemctl enable mtunnel-license
 systemctl start mtunnel-license
 log "Service da khoi dong"
 
+# ── 6b. Tạo script hiển thị Server Public Key (Ed25519) ─────
+cat > "$INSTALL_DIR/print_pubkey.py" << 'PYEOF'
+#!/usr/bin/env python3
+import base64, hashlib, sys
+
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from cryptography.hazmat.primitives import serialization
+
+SIGNING_KEY_FILE = "/opt/mtunnel/.signing_key"
+
+try:
+    with open(SIGNING_KEY_FILE, "rb") as f:
+        raw = f.read()
+except FileNotFoundError:
+    print("ERROR: chua tim thay signing key, service co the chua khoi dong xong", file=sys.stderr)
+    sys.exit(1)
+
+key = Ed25519PrivateKey.from_private_bytes(raw)
+pub_raw = key.public_key().public_bytes(
+    encoding=serialization.Encoding.Raw,
+    format=serialization.PublicFormat.Raw
+)
+
+print(f"SERVER_PUBLIC_KEY_B64={base64.b64encode(pub_raw).decode()}")
+print(f"PINNED_PUBKEY_SHA256={hashlib.sha256(pub_raw).hexdigest()}")
+PYEOF
+chmod +x "$INSTALL_DIR/print_pubkey.py"
+ln -sf "$INSTALL_DIR/print_pubkey.py" /usr/local/bin/mtunnel-pubkey
+log "Script hien thi public key da tao — lenh: mtunnel-pubkey"
+
+# ── 6c. Doi signing key duoc tao (server tao luc khoi dong) ─
+log "Doi service tao signing key..."
+for i in $(seq 1 10); do
+    [ -f "$INSTALL_DIR/.signing_key" ] && break
+    sleep 1
+done
+
+if [ -f "$INSTALL_DIR/.signing_key" ]; then
+    PUBKEY_OUT=$(python3 "$INSTALL_DIR/print_pubkey.py" 2>/dev/null || true)
+    SERVER_PUBLIC_KEY_B64=$(echo "$PUBKEY_OUT" | grep '^SERVER_PUBLIC_KEY_B64=' | cut -d= -f2-)
+    PINNED_PUBKEY_SHA256=$(echo "$PUBKEY_OUT" | grep '^PINNED_PUBKEY_SHA256=' | cut -d= -f2-)
+else
+    warn "Khong thay signing key sau 10s — kiem tra: journalctl -u mtunnel-license -e"
+    SERVER_PUBLIC_KEY_B64="(chua co - chay 'mtunnel-pubkey' sau)"
+    PINNED_PUBKEY_SHA256="(chua co - chay 'mtunnel-pubkey' sau)"
+fi
+
 # ── 7. Nginx ────────────────────────────────────────────────
 log "Cau hinh Nginx..."
 cat > /etc/nginx/sites-available/mtunnel << NGXEOF
@@ -250,9 +337,14 @@ echo -e "  ⚙️  Config URL : ${BOLD}https://$DOMAIN:8443/api/config${NC}"
 echo -e "  📡 SSE URL    : ${BOLD}https://$DOMAIN:8443/api/events${NC}"
 echo -e "  📦 Package    : ${BOLD}$PACKAGE${NC}"
 echo ""
+echo -e "${YELLOW}${BOLD}Nhung vao app Android (de verify chu ky /api/config):${NC}"
+echo -e "  SERVER_PUBLIC_KEY_B64 : ${BOLD}$SERVER_PUBLIC_KEY_B64${NC}"
+echo -e "  PINNED_PUBKEY_SHA256  : ${BOLD}$PINNED_PUBKEY_SHA256${NC}"
+echo ""
 echo -e "${CYAN}Lenh quan ly:${NC}"
 echo -e "  📋 Xem log    : journalctl -u mtunnel-license -f"
 echo -e "  🔑 Doi token  : mtunnel-token"
+echo -e "  🔐 Xem pubkey : mtunnel-pubkey"
 echo -e "  🔄 Restart    : systemctl restart mtunnel-license"
 echo -e "  📊 Status SSE : curl https://$DOMAIN:8443/health"
 echo ""
