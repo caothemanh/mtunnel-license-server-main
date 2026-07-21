@@ -130,7 +130,13 @@ def _fetch_config_from_github():
     try:
         with urllib.request.urlopen(req, timeout=10) as resp:
             data = resp.read()
-            json.loads(data)
+            # KHÔNG validate bằng json.loads() ở đây — nội dung thật là
+            # ciphertext (AESCrypt.encrypt() từ Gen tool), không phải JSON
+            # thô, nên json.loads() luôn fail dù tải về đúng. Server chỉ
+            # cần coi đây là bytes bất kỳ để ký, không quan tâm định dạng.
+            if len(data) == 0:
+                app.logger.error("[config] GitHub tra ve file rong")
+                return None
             return data
     except urllib.error.HTTPError as e:
         app.logger.error(f"[config] GitHub fetch HTTP {e.code}: {e.reason}")
