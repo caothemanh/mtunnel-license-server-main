@@ -83,24 +83,29 @@ Server tải file này (dạng bytes bất kỳ, không cần là JSON — vì b
 }
 ```
 
-## Xác minh chữ ký (Ed25519) trong app Android
+## Hai loại key CẦN PHÂN BIỆT RÕ — nhầm 2 cái này là nguyên nhân phổ biến nhất khiến app không tải được config
 
-Sau khi cài xong, script in ra:
+Server dùng **2 loại key hoàn toàn khác nhau**, phục vụ 2 mục đích khác nhau. Trộn lẫn chúng (dùng nhầm giá trị của cái này cho cái kia) sẽ khiến app luôn từ chối kết nối hoặc từ chối config dù server hoạt động bình thường:
 
-```
-SERVER_PUBLIC_KEY_B64 : <base64 public key>
-PINNED_PUBKEY_SHA256  : <sha256 của public key>
-```
+| | Mục đích | Lệnh xem | Dán vào đâu (Android) |
+|---|---|---|---|
+| **Ed25519 signing key** | Ký nội dung config (`/api/config`) để app verify tính toàn vẹn | `mtunnel-pubkey` | `SERVER_PUBLIC_KEYS_B64[]` |
+| **TLS certificate pin** | Pin chứng chỉ HTTPS khi app mở kết nối tới server | `mtunnel-tlspin` | `PINNED_PUBKEYS_SHA256[]` |
 
-Nhúng `SERVER_PUBLIC_KEY_B64` vào app để verify `signature` trả về từ `/api/config`. Dùng `PINNED_PUBKEY_SHA256` để **pin cứng** giá trị này trong app (so sánh hash trước khi tin public key), tránh trường hợp cấu hình sai hoặc bị đánh tráo key.
-
-Xem lại 2 giá trị này bất cứ lúc nào bằng:
+**Lưu ý quan trọng nếu domain đang bật Cloudflare Proxy (orange cloud):**
+`mtunnel-tlspin` sẽ **không thể tự tính pin** trên chính VPS, vì client (app) sẽ bắt tay TLS với chứng chỉ của **Cloudflare edge**, không phải chứng chỉ trên VPS. Trong trường hợp này, phải chạy lệnh sau **từ một máy khác** (không phải VPS này, để tránh NAT hairpin cho kết quả sai) sau khi cài xong:
 
 ```bash
-mtunnel-pubkey
+openssl s_client -connect <domain>:<port> </dev/null 2>/dev/null \
+  | openssl x509 -pubkey -noout \
+  | openssl pkey -pubin -outform der \
+  | openssl dgst -sha256 -binary \
+  | base64
 ```
 
-> Khoá riêng (private key) nằm ở `/opt/mtunnel/.signing_key`, chỉ `www-data` đọc được (chmod 600) — **không** chia sẻ file này.
+Vì chứng chỉ này do Cloudflare quản lý (có thể dùng chung cho nhiều domain trong cùng zone và tự đổi theo chu kỳ renew), nên cần kiểm tra lại định kỳ nếu app đột ngột báo lỗi tải config sau một thời gian hoạt động ổn định.
+
+> Khoá riêng (private key) của signing key nằm ở `/opt/mtunnel/.signing_key`, chỉ `www-data` đọc được (chmod 600) — **không** chia sẻ file này.
 
 ## Lệnh quản lý
 

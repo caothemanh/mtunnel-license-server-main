@@ -310,9 +310,14 @@ systemctl start mtunnel-license
 log "Service da khoi dong"
 
 # ── 6b. Tạo script hiển thị Server Public Key (Ed25519) ─────
+# LUU Y: script nay CHI in ra key dung de verify CHU KY /api/config
+# (Ed25519, tach biet hoan toan voi chung chi TLS). KHONG dung gia tri
+# nay lam TLS pin — xem muc "TLS_PINNED_PUBKEY_SHA256" duoc in rieng
+# o buoc 8d ben duoi, do 2 loai key nay khac nhau hoan toan va tron
+# ten voi nhau la nguyen nhan gay loi config khong tai duoc ve truoc day.
 cat > "$INSTALL_DIR/print_pubkey.py" << 'PYEOF'
 #!/usr/bin/env python3
-import base64, hashlib, sys
+import base64, sys
 
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from cryptography.hazmat.primitives import serialization
@@ -332,12 +337,14 @@ pub_raw = key.public_key().public_bytes(
     format=serialization.PublicFormat.Raw
 )
 
+# Chi 1 gia tri duy nhat - dung de verify CHU KY config, KHONG lien quan TLS
 print(f"SERVER_PUBLIC_KEY_B64={base64.b64encode(pub_raw).decode()}")
-print(f"PINNED_PUBKEY_SHA256={hashlib.sha256(pub_raw).hexdigest()}")
+print("(Gia tri nay dung cho SERVER_PUBLIC_KEYS_B64[] ben Android, de verify chu ky /api/config.")
+print(" KHONG dung cho TLS pin — chay 'mtunnel-tlspin' de lay TLS pin rieng.)")
 PYEOF
 chmod +x "$INSTALL_DIR/print_pubkey.py"
 ln -sf "$INSTALL_DIR/print_pubkey.py" /usr/local/bin/mtunnel-pubkey
-log "Script hien thi public key da tao — lenh: mtunnel-pubkey"
+log "Script hien thi signing pubkey da tao — lenh: mtunnel-pubkey"
 
 # ── 6c. Doi signing key duoc tao (server tao luc khoi dong) ─
 log "Doi service tao signing key..."
@@ -349,11 +356,32 @@ done
 if [ -f "$INSTALL_DIR/.signing_key" ]; then
     PUBKEY_OUT=$(python3 "$INSTALL_DIR/print_pubkey.py" 2>/dev/null || true)
     SERVER_PUBLIC_KEY_B64=$(echo "$PUBKEY_OUT" | grep '^SERVER_PUBLIC_KEY_B64=' | cut -d= -f2-)
-    PINNED_PUBKEY_SHA256=$(echo "$PUBKEY_OUT" | grep '^PINNED_PUBKEY_SHA256=' | cut -d= -f2-)
 else
     warn "Khong thay signing key sau 10s — kiem tra: journalctl -u mtunnel-license -e"
     SERVER_PUBLIC_KEY_B64="(chua co - chay 'mtunnel-pubkey' sau)"
-    PINNED_PUBKEY_SHA256="(chua co - chay 'mtunnel-pubkey' sau)"
+fi
+
+# ── 6d. Hoi rieng ve Cloudflare Proxy — anh huong TRUC TIEP toi TLS
+#        pin (khac hoan toan voi signing key o tren). Neu domain bat
+#        Proxy (orange cloud), client se bat tay TLS voi CHUNG CHI CUA
+#        CLOUDFLARE (vd Google Trust Services), khong phai chung chi
+#        cua VPS nay — nen KHONG THE tinh pin cuc bo tren may nay duoc,
+#        phai lay tu ben ngoai sau khi cai xong.
+CF_PROXIED="n"
+if [ "$SSL_METHOD" = "1" ]; then
+    echo ""
+    echo -e "${CYAN}${BOLD}--- Cloudflare Proxy status cho domain nay ---${NC}"
+    echo -e "${YELLOW}Vao Cloudflare Dashboard > DNS, xem dong ban ghi cua domain nay${NC}"
+    echo -e "${YELLOW}(hoac ban ghi wildcard *.domain neu khong co dong rieng):${NC}"
+    echo -e "${YELLOW}  - May xam (DNS only)  -> chon 'k'${NC}"
+    echo -e "${YELLOW}  - May cam (Proxied)   -> chon 'c'${NC}"
+    printf "${CYAN}Domain nay dang Proxied (cam) tren Cloudflare?${NC} (c/k) [k]: "
+    read CF_PROXIED_ANS
+    if [ "$CF_PROXIED_ANS" = "c" ] || [ "$CF_PROXIED_ANS" = "C" ]; then
+        CF_PROXIED="y"
+        warn "Domain Proxied — TLS pin PHAI lay tu ben ngoai sau khi cai xong (xem huong dan cuoi script)."
+        warn "Cert client thay se la cert cua Cloudflare (dung chung cho ca zone), co the doi theo chu ky renew cua Cloudflare."
+    fi
 fi
 
 # ── 7a. Do cong SSL (port 80/443 co the da bi service khac nhu ────
@@ -500,6 +528,54 @@ if ! systemctl is-active --quiet nginx; then
 fi
 log "Nginx da chay HTTPS tren port $SSL_PORT"
 
+# ── 8d. Tao lenh mtunnel-tlspin — TACH BIET hoan toan voi mtunnel-pubkey ──
+# mtunnel-pubkey  = Ed25519 signing key (verify chu ky /api/config)
+# mtunnel-tlspin  = pubkey hash cua CHUNG CHI TLS (dung de pin HTTPS)
+# Day la 2 khai niem khac nhau — tron 2 cai nay la nguyen nhan pho bien
+# nhat khien app khong tai duoc config du server hoat dong binh thuong.
+cat > "$INSTALL_DIR/print_tlspin.sh" << TLSPINEOF
+#!/bin/bash
+DOMAIN="$DOMAIN"
+SSL_PORT="$SSL_PORT"
+SSL_METHOD="$SSL_METHOD"
+CF_PROXIED="$CF_PROXIED"
+CERT_PATH="$CERT_PATH"
+
+if [ "\$CF_PROXIED" = "y" ]; then
+    echo "Domain nay dang Proxied qua Cloudflare — KHONG THE tinh TLS pin"
+    echo "chinh xac tu chinh VPS nay (client thay cert cua Cloudflare, khac"
+    echo "voi cert goc tren VPS)."
+    echo ""
+    echo "Chay lenh sau tu MOT MAY KHAC (dien thoai 4G, laptop ca nhan —"
+    echo "KHONG phai tu VPS nay, de tranh NAT hairpin cho ket qua sai):"
+    echo ""
+    echo "  openssl s_client -connect \$DOMAIN:\$SSL_PORT </dev/null 2>/dev/null \\"
+    echo "    | openssl x509 -pubkey -noout \\"
+    echo "    | openssl pkey -pubin -outform der \\"
+    echo "    | openssl dgst -sha256 -binary \\"
+    echo "    | base64"
+    echo ""
+    echo "Ket qua la TLS_PINNED_PUBKEY_SHA256 — dan vao PINNED_PUBKEYS_SHA256[]"
+    echo "ben Android voi tien to 'sha256//'. LUU Y: vi cert nay do Cloudflare"
+    echo "quan ly (co the dung chung cho nhieu domain trong cung zone va tu"
+    echo "doi khi Cloudflare renew), can chay lai lenh nay dinh ky de kiem tra"
+    echo "pin con dung khong, dac biet neu app bao loi tai config dot ngot."
+else
+    echo "Domain KHONG proxy (DNS only) — tinh truc tiep tu chung chi cuc bo:"
+    echo ""
+    PIN=\$(openssl x509 -in "\$CERT_PATH" -noout -pubkey 2>/dev/null \\
+        | openssl pkey -pubin -outform der 2>/dev/null \\
+        | openssl dgst -sha256 -binary \\
+        | base64)
+    echo "TLS_PINNED_PUBKEY_SHA256 = sha256//\$PIN"
+    echo ""
+    echo "Dan gia tri tren vao PINNED_PUBKEYS_SHA256[] ben Android."
+fi
+TLSPINEOF
+chmod +x "$INSTALL_DIR/print_tlspin.sh"
+ln -sf "$INSTALL_DIR/print_tlspin.sh" /usr/local/bin/mtunnel-tlspin
+log "Script tinh TLS pin da tao — lenh: mtunnel-tlspin"
+
 # ── 8c. Auto-renew (chi ap dung cho phuong thuc 1 — Let's Encrypt):
 #        certbot renew se tu dung lai dns-cloudflare plugin (da luu
 #        trong renewal config). Chi can dam bao nginx reload sau renew.
@@ -558,9 +634,19 @@ echo -e "  ⚙️  Config URL : ${BOLD}https://$DOMAIN:$SSL_PORT/api/config${NC}
 echo -e "  📡 SSE URL    : ${BOLD}https://$DOMAIN:$SSL_PORT/api/events${NC}"
 echo -e "  📦 Package    : ${BOLD}$PACKAGE${NC}"
 echo ""
-echo -e "${YELLOW}${BOLD}Nhung vao app Android (de verify chu ky /api/config):${NC}"
+echo -e "${YELLOW}${BOLD}[1/2] Ed25519 signing key — de verify CHU KY /api/config:${NC}"
 echo -e "  SERVER_PUBLIC_KEY_B64 : ${BOLD}$SERVER_PUBLIC_KEY_B64${NC}"
-echo -e "  PINNED_PUBKEY_SHA256  : ${BOLD}$PINNED_PUBKEY_SHA256${NC}"
+echo -e "  (dan vao SERVER_PUBLIC_KEYS_B64[] ben Android)"
+echo ""
+echo -e "${YELLOW}${BOLD}[2/2] TLS certificate pin — DE RIENG, KHAC HOAN TOAN voi key o tren:${NC}"
+if [ "$CF_PROXIED" = "y" ]; then
+    echo -e "  Domain dang Proxied qua Cloudflare — KHONG tinh duoc tai day."
+    echo -e "  Chay lenh ${BOLD}mtunnel-tlspin${NC} de xem huong dan lay pin tu ben ngoai."
+else
+    TLSPIN_NOW=$("$INSTALL_DIR/print_tlspin.sh" 2>/dev/null | grep '^TLS_PINNED_PUBKEY_SHA256' || true)
+    echo -e "  ${BOLD}$TLSPIN_NOW${NC}"
+    echo -e "  (dan vao PINNED_PUBKEYS_SHA256[] ben Android)"
+fi
 echo ""
 if [ "$SSL_METHOD" = "2" ]; then
     echo -e "${YELLOW}${BOLD}⚠️  Luu y ve chung chi tu dan (vd Cloudflare Origin CA):${NC}"
@@ -568,14 +654,18 @@ if [ "$SSL_METHOD" = "2" ]; then
     echo -e "  App phai tu pin chung chi nay (hoac root CA cua no) trong"
     echo -e "  network_security_config.xml, neu khong ket noi HTTPS se that bai."
     echo -e "  Het han: ${BOLD}$CERT_EXPIRY${NC}"
+    echo -e "  Chung chi Origin CA CHI hop le neu domain o che do DNS only —"
+    echo -e "  neu ban dang bat Proxy (Cloudflare cam), client se KHONG BAO GIO"
+    echo -e "  thay chung chi nay, setup se khong hoat dong dung."
     echo ""
 fi
 echo -e "${CYAN}Lenh quan ly:${NC}"
-echo -e "  📋 Xem log    : journalctl -u mtunnel-license -f"
-echo -e "  🔑 Doi token  : mtunnel-token"
-echo -e "  🔐 Xem pubkey : mtunnel-pubkey"
-echo -e "  🔄 Restart    : systemctl restart mtunnel-license"
-echo -e "  📊 Status SSE : curl https://$DOMAIN:$SSL_PORT/health"
+echo -e "  📋 Xem log     : journalctl -u mtunnel-license -f"
+echo -e "  🔑 Doi token   : mtunnel-token"
+echo -e "  🔐 Signing key : mtunnel-pubkey  (chu ky /api/config)"
+echo -e "  📌 TLS pin     : mtunnel-tlspin  (pin HTTPS — khac hoan toan voi tren)"
+echo -e "  🔄 Restart     : systemctl restart mtunnel-license"
+echo -e "  📊 Status SSE  : curl https://$DOMAIN:$SSL_PORT/health"
 echo ""
 echo -e "${CYAN}Thu hoi license:${NC}"
 echo -e "  Server hien chi ho tro MOT token dung chung cho toan bo app."
