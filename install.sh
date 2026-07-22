@@ -85,19 +85,28 @@ else
     echo -e "${YELLOW}duyet/OS tin cay mac dinh. App Android ket noi thang toi VPS se can tu${NC}"
     echo -e "${YELLOW}pin chung chi nay (hoac root CA cua no) trong network_security_config.${NC}"
     echo ""
-    read_multiline_pem() {
+    read_pem_block() {
+        # Doc tung dong va tu dung lai NGAY KHI gap dong ket thuc PEM
+        # (vd -----END CERTIFICATE----- hoac -----END PRIVATE KEY-----),
+        # khong yeu cau nguoi dung go them dong "END" nao ca — dan xong
+        # (Ctrl+Shift+V / chuot phai) la script tu chay tiep.
         local content="" line
         while IFS= read -r line; do
-            [ "$line" = "END" ] && break
             content+="$line"$'\n'
+            case "$line" in
+                *"-----END CERTIFICATE-----"*)          break ;;
+                *"-----END PRIVATE KEY-----"*)           break ;;
+                *"-----END RSA PRIVATE KEY-----"*)       break ;;
+                *"-----END EC PRIVATE KEY-----"*)        break ;;
+            esac
         done
         printf '%s' "$content"
     }
-    echo -e "${CYAN}Dan noi dung Origin Certificate (PEM), ket thuc bang dong rieng chi co END:${NC}"
-    CERT_PEM=$(read_multiline_pem)
+    echo -e "${CYAN}Dan noi dung Origin Certificate (PEM) roi Enter — tu dung khi gap dong -----END CERTIFICATE-----:${NC}"
+    CERT_PEM=$(read_pem_block)
     echo ""
-    echo -e "${CYAN}Dan noi dung Private Key (PEM), ket thuc bang dong rieng chi co END:${NC}"
-    KEY_PEM=$(read_multiline_pem)
+    echo -e "${CYAN}Dan noi dung Private Key (PEM) roi Enter — tu dung khi gap dong -----END ...PRIVATE KEY-----:${NC}"
+    KEY_PEM=$(read_pem_block)
     echo ""
 
     echo "$CERT_PEM" | grep -q "BEGIN CERTIFICATE" || error "Noi dung dan vao khong giong chung chi PEM hop le (thieu BEGIN CERTIFICATE)"
