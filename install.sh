@@ -169,7 +169,45 @@ if [ "$SSL_METHOD" = "1" ]; then
     CERTBOT_VENV="/opt/certbot-venv"
     python3 -m venv "$CERTBOT_VENV"
     "$CERTBOT_VENV/bin/pip" install -q --upgrade pip
-    "$CERTBOT_VENV/bin/pip" install -q certbot certbot-dns-cloudflare
+
+    # QUAN TRONG: ghim version cu the cho certbot + pyOpenSSL + cryptography.
+    # Neu de pip tu chon "moi nhat" cho tung goi rieng le, se co luc PyPI
+    # publish cryptography ban moi hon pyOpenSSL con ho tro (pyOpenSSL luon
+    # cham theo sau cryptography vai tuan/thang) -> "acme" import loi:
+    #   AttributeError: module 'OpenSSL.crypto' has no attribute 'X509Extension'
+    # Loi nay khong lien quan gi den domain/Cloudflare token, xay ra ngay
+    # luc import certbot, truoc khi chay bat ky logic DNS-01 nao.
+    # Ghi chu: cryptography/pyOpenSSL ban qua moi (vd 42.x/24.x tro len)
+    # da bo ho tro Python 3.8 (Ubuntu 20.04 focal van dung Python 3.8.10
+    # mac dinh), pip se tu dong bo qua cac wheel do va roi vao truong hop
+    # khong tim duoc ban tuong thich -> loi kho hieu. Vi vay ghim ban
+    # 23.2.0 / 41.0.7 — bo doi nay CHAY DUOC voi ca Python 3.8 lan 3.9+,
+    # da kiem chung truc tiep tren Ubuntu 20.04 + Python 3.8.10.
+    set +e
+    "$CERTBOT_VENV/bin/pip" install -q \
+        "certbot==2.11.0" \
+        "certbot-dns-cloudflare==2.11.0" \
+        "pyOpenSSL==23.2.0" \
+        "cryptography==41.0.7"
+    CERTBOT_INSTALL_STATUS=$?
+    if [ $CERTBOT_INSTALL_STATUS -ne 0 ]; then
+        warn "Cai certbot voi bo version ghim san that bai, thu lai voi --only-binary de tranh phai compile..."
+        "$CERTBOT_VENV/bin/pip" install -q --only-binary=:all: \
+            "certbot==2.11.0" \
+            "certbot-dns-cloudflare==2.11.0" \
+            "pyOpenSSL==23.2.0" \
+            "cryptography==41.0.7"
+        CERTBOT_INSTALL_STATUS=$?
+    fi
+    set -e
+    [ $CERTBOT_INSTALL_STATUS -ne 0 ] && error "Khong cai duoc certbot (venv). Chay: $CERTBOT_VENV/bin/pip install certbot certbot-dns-cloudflare -v de xem chi tiet"
+
+    # Kiem tra ngay sau khi cai — phat hien loi import truoc khi nguoi dung
+    # di tiep den buoc xin SSL (tranh cho ho phai doc log certbot roi doan).
+    if ! "$CERTBOT_VENV/bin/certbot" --version > /tmp/certbot-selfcheck.log 2>&1; then
+        error "Certbot cai xong nhung khong chay duoc (loi import). Chi tiet: cat /tmp/certbot-selfcheck.log"
+    fi
+
     ln -sf "$CERTBOT_VENV/bin/certbot" /usr/local/bin/certbot
     hash -r
     log "Certbot (venv, ho tro Cloudflare API Token) da cai xong: $(certbot --version 2>/dev/null)"
