@@ -33,20 +33,130 @@ echo -e "${BOLD}═════════════════════�
 echo ""
 
 # ── Nhập thông tin cài đặt ──────────────────────────────────
-printf "${CYAN}Nhap domain${NC} [vd: license.example.com]: "
+echo -e "${YELLOW}${BOLD}Luu y quan trong ve domain:${NC}"
+echo -e "${YELLOW}Neu VPS nay dang dung chung lam may chu VPN (Psiphon/V2Ray...)${NC}"
+echo -e "${YELLOW}va domain VPN chinh dang bat Cloudflare Proxy (may cam) de an IP,${NC}"
+echo -e "${YELLOW}HAY DUNG 1 SUBDOMAIN RIENG cho license server nay (vd: lic5.domain.com)${NC}"
+echo -e "${YELLOW}va dat subdomain do DNS only (may xam) tren Cloudflare — neu khong,${NC}"
+echo -e "${YELLOW}TLS pin se khong on dinh (xem chi tiet o cuoi script).${NC}"
+echo ""
+printf "${CYAN}Nhap domain${NC} [vd: lic5.example.com]: "
 read DOMAIN
-printf "${CYAN}Nhap email${NC} [cho SSL cert]: "
-read EMAIL
 printf "${CYAN}Nhap package name${NC} [vd: com.example.app]: "
 read PACKAGE
 
 [ -z "$DOMAIN"  ] && error "Domain khong duoc de trong"
-[ -z "$EMAIL"   ] && error "Email khong duoc de trong"
 [ -z "$PACKAGE" ] && error "Package name khong duoc de trong"
+
+# Tu dong kiem tra domain co ve dang Proxied qua Cloudflare khong, bang
+# cach so sanh IP DNS tra ve voi IP that cua VPS nay. Day chi la goi y
+# (khong chinh xac 100% do co the co NAT/nhieu IP...), khong chan cai dat.
+echo ""
+info "Kiem tra DNS cua $DOMAIN..."
+RESOLVED_IP=$(dig +short "$DOMAIN" 2>/dev/null | tail -1)
+MY_IP=$(curl -s -4 https://ifconfig.me 2>/dev/null || curl -s -4 https://icanhazip.com 2>/dev/null)
+if [ -n "$RESOLVED_IP" ] && [ -n "$MY_IP" ]; then
+    if [ "$RESOLVED_IP" != "$MY_IP" ]; then
+        warn "Domain $DOMAIN dang tro toi IP $RESOLVED_IP, KHAC voi IP that cua VPS nay ($MY_IP)."
+        warn "Day la dau hieu domain dang BAT Cloudflare Proxy (may cam) — TLS pin"
+        warn "se KHONG on dinh (xem huong dan 'mtunnel-tlspin' sau khi cai xong)."
+        printf "${YELLOW}Van tiep tuc cai dat voi domain nay?${NC} (y/N): "
+        read CONTINUE_ANYWAY
+        if [ "$CONTINUE_ANYWAY" != "y" ] && [ "$CONTINUE_ANYWAY" != "Y" ]; then
+            error "Da huy. Tao subdomain rieng (DNS only) roi chay lai script."
+        fi
+    else
+        log "Domain $DOMAIN tro dung IP VPS nay ($MY_IP) — dang DNS only, TLS pin se on dinh."
+    fi
+else
+    warn "Khong kiem tra duoc DNS tu dong (thieu 'dig' hoac khong lay duoc IP) — bo qua buoc nay."
+fi
+echo ""
 
 echo ""
 info "Token se duoc thiet lap sau khi cai dat xong"
 echo ""
+
+# ── Chon phuong thuc lay chung chi SSL ──────────────────────
+echo -e "${CYAN}${BOLD}--- Chung chi SSL ---${NC}"
+echo "  1) Let's Encrypt tu dong qua Cloudflare DNS-01 (certbot, can Cloudflare API Token)"
+echo "  2) Tu dan chung chi co san (vd: Cloudflare Origin CA certificate)"
+echo ""
+printf "${CYAN}Chon${NC} (1/2) [1]: "
+read SSL_METHOD
+SSL_METHOD=${SSL_METHOD:-1}
+[ "$SSL_METHOD" != "1" ] && [ "$SSL_METHOD" != "2" ] && error "Lua chon khong hop le"
+echo ""
+
+EMAIL=""
+CF_TOKEN=""
+CERT_PEM=""
+KEY_PEM=""
+
+if [ "$SSL_METHOD" = "1" ]; then
+    printf "${CYAN}Nhap email${NC} [cho SSL cert]: "
+    read EMAIL
+    [ -z "$EMAIL" ] && error "Email khong duoc de trong"
+    echo ""
+
+    # DNS-01 challenge duoc dung thay vi HTTP-01 vi khong can port 80,
+    # tranh xung dot voi cac service khac (vd psiphond) da chiem port 80/443.
+    echo -e "${CYAN}${BOLD}--- Cloudflare API Token (de xin SSL, khong can port 80) ---${NC}"
+    echo -e "${YELLOW}Tao tai: https://dash.cloudflare.com/profile/api-tokens${NC}"
+    echo -e "${YELLOW}Dung template 'Edit zone DNS', gioi han vao đúng zone cua domain ban dung${NC}"
+    echo ""
+    printf "${CYAN}Cloudflare API Token${NC} (an khi go): "
+    read -s CF_TOKEN
+    echo ""
+    [ -z "$CF_TOKEN" ] && error "Can Cloudflare API Token de xin SSL qua DNS-01 (khong the dung port 80/443)"
+    echo ""
+else
+    echo -e "${CYAN}${BOLD}--- Chung chi SSL co san (vd: Cloudflare Origin CA) ---${NC}"
+    echo -e "${YELLOW}Tao tai: Cloudflare dashboard > SSL/TLS > Origin Server > Create Certificate${NC}"
+    echo -e "${YELLOW}Luu y: Origin CA cert CHI duoc Cloudflare edge tin cay, khong duoc trinh${NC}"
+    echo -e "${YELLOW}duyet/OS tin cay mac dinh. App Android ket noi thang toi VPS se can tu${NC}"
+    echo -e "${YELLOW}pin chung chi nay (hoac root CA cua no) trong network_security_config.${NC}"
+    echo ""
+
+    read_pem_until_blank_line() {
+        # Doc nhieu dong, tu dung lai khi gap MOT DONG TRONG (bam Enter
+        # them 1 lan sau khi dan). Bo qua dong trong o DAU (phong khi
+        # nguoi dung lo bam Enter truoc khi dan). Cach nay khong phu
+        # thuoc vao dinh dang PEM cu the (RSA/EC/PKCS8...) hay cach
+        # terminal xu ly dong cuoi, nen chac chan hon nhieu so voi do
+        # tim chuoi "-----END...-----".
+        local content="" line
+        while IFS= read -r line; do
+            if [ -z "$line" ]; then
+                [ -n "$content" ] && break
+                continue
+            fi
+            content+="$line"$'\n'
+        done
+        printf '%s' "$content"
+    }
+
+    echo -e "${CYAN}Buoc 1/2 — Dan noi dung Origin Certificate (PEM):${NC}"
+    echo -e "${YELLOW}Dan toan bo (ca dong BEGIN va END), roi bam Enter THEM 1 LAN NUA${NC}"
+    echo -e "${YELLOW}(de lai 1 dong trong) — script se tu nhan biet va chuyen tiep.${NC}"
+    echo ""
+    CERT_PEM=$(read_pem_until_blank_line)
+    [ -z "$CERT_PEM" ] && error "Chua nhan duoc noi dung Certificate nao — chay lai script va dan lai"
+    echo -e "${GREEN}Da nhan Certificate (${NC}$(echo "$CERT_PEM" | wc -l)${GREEN} dong).${NC}"
+    echo ""
+
+    echo -e "${CYAN}Buoc 2/2 — Dan noi dung Private Key (PEM):${NC}"
+    echo -e "${YELLOW}Dan toan bo (ca dong BEGIN va END), roi bam Enter THEM 1 LAN NUA${NC}"
+    echo -e "${YELLOW}(de lai 1 dong trong) — script se tu nhan biet va chuyen tiep.${NC}"
+    echo ""
+    KEY_PEM=$(read_pem_until_blank_line)
+    [ -z "$KEY_PEM" ] && error "Chua nhan duoc noi dung Private Key nao — chay lai script va dan lai"
+    echo -e "${GREEN}Da nhan Private Key (${NC}$(echo "$KEY_PEM" | wc -l)${GREEN} dong).${NC}"
+    echo ""
+
+    echo "$CERT_PEM" | grep -q "BEGIN CERTIFICATE" || error "Noi dung Certificate khong hop le (thieu dong BEGIN CERTIFICATE) — chay lai script va dan lai"
+    echo "$KEY_PEM" | grep -qE "BEGIN (RSA |EC )?PRIVATE KEY" || error "Noi dung Private Key khong hop le (thieu dong BEGIN ... PRIVATE KEY) — chay lai script va dan lai"
+fi
 
 # ── Nhập cấu hình GitHub cho /api/config (tùy chọn) ─────────
 echo -e "${CYAN}${BOLD}--- Dong bo file config tu GitHub (tuy chon) ---${NC}"
@@ -67,25 +177,35 @@ read -s GH_TOKEN
 echo ""
 echo ""
 
-# ── Nhập Cloudflare API Token (dùng cho xin SSL qua DNS-01) ─
-# DNS-01 challenge duoc dung thay vi HTTP-01 vi khong can port 80,
-# tranh xung dot voi cac service khac (vd psiphond) da chiem port 80/443.
-echo -e "${CYAN}${BOLD}--- Cloudflare API Token (de xin SSL, khong can port 80) ---${NC}"
-echo -e "${YELLOW}Tao tai: https://dash.cloudflare.com/profile/api-tokens${NC}"
-echo -e "${YELLOW}Dung template 'Edit zone DNS', gioi han vao đúng zone cua domain ban dung${NC}"
-echo ""
-printf "${CYAN}Cloudflare API Token${NC} (an khi go): "
-read -s CF_TOKEN
-echo ""
-[ -z "$CF_TOKEN" ] && error "Can Cloudflare API Token de xin SSL qua DNS-01 (khong the dung port 80/443)"
-echo ""
-
 # ── 1. Cài packages ─────────────────────────────────────────
 log "Cai dat dependencies..."
 apt update -qq
-apt install -y python3-pip nginx certbot python3-certbot-dns-cloudflare curl > /dev/null 2>&1
+apt install -y python3-pip python3-venv nginx curl > /dev/null 2>&1
 pip3 install flask gunicorn gevent cryptography -q
 log "Dependencies da cai xong"
+
+# ── 1b. Cai certbot + plugin Cloudflare qua pip venv rieng ──
+# KHONG dung apt (certbot / python3-certbot-dns-cloudflare) vi ban apt cua
+# Ubuntu qua cu doi voi Cloudflare API Token:
+#   - Ubuntu 20.04 (focal): certbot-dns-cloudflare 0.39.0 — khong biet
+#     "dns_cloudflare_api_token" ton tai, chi hieu Global API Key cu
+#     (dns_cloudflare_email + dns_cloudflare_api_key) -> loi
+#     "Missing properties ... dns_cloudflare_email/dns_cloudflare_api_key"
+#     du file .ini da dung dinh dang Token 100%.
+#   - Can cloudflare python module >= 2.3.1 de Token hoat dong; pip venv
+#     luon lay ban moi nhat nen tranh han loai loi nay.
+# Chi can khi dung phuong thuc 1 (Let's Encrypt DNS-01); phuong thuc 2
+# (tu dan chung chi) khong dung certbot nen bo qua buoc nay.
+if [ "$SSL_METHOD" = "1" ]; then
+    log "Cai certbot + Cloudflare plugin (pip venv, ho tro API Token)..."
+    CERTBOT_VENV="/opt/certbot-venv"
+    python3 -m venv "$CERTBOT_VENV"
+    "$CERTBOT_VENV/bin/pip" install -q --upgrade pip
+    "$CERTBOT_VENV/bin/pip" install -q certbot certbot-dns-cloudflare
+    ln -sf "$CERTBOT_VENV/bin/certbot" /usr/local/bin/certbot
+    hash -r
+    log "Certbot (venv, ho tro Cloudflare API Token) da cai xong: $(certbot --version 2>/dev/null)"
+fi
 
 # ── 2. Tạo thư mục ──────────────────────────────────────────
 mkdir -p "$INSTALL_DIR"
@@ -125,9 +245,12 @@ GITHUB_RAW="https://raw.githubusercontent.com/caothemanh/mtunnel-license-server-
 curl -fsSL "$GITHUB_RAW/server.py" -o "$INSTALL_DIR/server.py"
 log "server.py da tai xong"
 
-# ── 5. Tạo update_token.sh ──────────────────────────────────
-log "Tao script quan ly token..."
-cat > "$INSTALL_DIR/update_token.sh" << 'TKEOF'
+# ── 5. Tạo mtunnel-menu.sh (menu quản lý tổng hợp) ──────────
+# Gõ "mtunnel-token" se mo menu nay (khong hoi thang token moi nhu truoc) —
+# gom tat ca lenh quan ly (doi token, xem pubkey, TLS pin, health, log,
+# restart, signing key export/import) vao 1 cho duy nhat, de nho hon.
+log "Tao script quan ly tong hop..."
+cat > "$INSTALL_DIR/mtunnel-menu.sh" << 'TKEOF'
 #!/bin/bash
 GREEN='\033[0;32m'
 CYAN='\033[0;36m'
@@ -139,63 +262,214 @@ NC='\033[0m'
 INSTALL_DIR="/opt/mtunnel"
 TOKEN_FILE="$INSTALL_DIR/.token"
 CONFIG_FILE="$INSTALL_DIR/.config"
+SIGNING_KEY_FILE="$INSTALL_DIR/.signing_key"
 
-# Đọc config
-PACKAGE=""
-DOMAIN=""
+PACKAGE=""; DOMAIN=""; SSL_PORT=""
 if [ -f "$CONFIG_FILE" ]; then
     PACKAGE=$(grep "^PACKAGE=" "$CONFIG_FILE" | cut -d= -f2)
     DOMAIN=$(grep "^DOMAIN=" "$CONFIG_FILE" | cut -d= -f2)
+    SSL_PORT=$(grep "^SSL_PORT=" "$CONFIG_FILE" | cut -d= -f2)
 fi
+SSL_PORT=${SSL_PORT:-443}
 
-clear
-echo ""
-echo -e "${GREEN}${BOLD}═══════════════════════════════════════════${NC}"
-echo -e "${GREEN}${BOLD}   MTunnel - Thiet lap Token               ${NC}"
-echo -e "${GREEN}${BOLD}═══════════════════════════════════════════${NC}"
-echo ""
-echo -e "  Package : ${CYAN}$PACKAGE${NC}"
-echo -e "  Domain  : ${CYAN}$DOMAIN${NC}"
-echo ""
+print_public_key() {
+    python3 - << PYEOF
+import base64
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from cryptography.hazmat.primitives import serialization
+try:
+    with open("$SIGNING_KEY_FILE", "rb") as f:
+        raw = f.read()
+    key = Ed25519PrivateKey.from_private_bytes(raw)
+    pub = key.public_key().public_bytes(
+        encoding=serialization.Encoding.Raw,
+        format=serialization.PublicFormat.Raw
+    )
+    print(base64.b64encode(pub).decode())
+except FileNotFoundError:
+    print("(chua co signing key - service co the chua khoi dong xong)")
+PYEOF
+}
 
-if [ -f "$TOKEN_FILE" ] && [ -s "$TOKEN_FILE" ]; then
-    CURRENT=$(cat "$TOKEN_FILE")
-    echo -e "${YELLOW}Token hien tai:${NC} ${CURRENT:0:8}...${CURRENT: -4}"
+pause() {
     echo ""
-fi
+    read -p "Nhan Enter de quay lai menu..." _
+}
 
-echo -e "${CYAN}Huong dan lay token:${NC}"
-echo "  1. Build release APK (cung keystore)"
-echo "  2. Chay app tren thiet bi"
-echo "  3. Token hien trong AlertDialog luc khoi dong"
-echo "  4. Copy token roi paste vao day"
-echo ""
-read -p "Nhap token moi: " NEW_TOKEN
+show_header() {
+    clear
+    echo ""
+    echo -e "${GREEN}${BOLD}═══════════════════════════════════════════${NC}"
+    echo -e "${GREEN}${BOLD}   MTunnel License Server - Quan ly        ${NC}"
+    echo -e "${GREEN}${BOLD}═══════════════════════════════════════════${NC}"
+    echo ""
+    echo -e "  Domain  : ${CYAN}$DOMAIN${NC}"
+    echo -e "  Port    : ${CYAN}$SSL_PORT${NC}"
+    echo -e "  Package : ${CYAN}$PACKAGE${NC}"
+    if [ -f "$TOKEN_FILE" ] && [ -s "$TOKEN_FILE" ]; then
+        CURRENT=$(cat "$TOKEN_FILE")
+        echo -e "  Token   : ${CYAN}${CURRENT:0:8}...${CURRENT: -4}${NC}"
+    else
+        echo -e "  Token   : ${YELLOW}(chua thiet lap)${NC}"
+    fi
+    echo ""
+}
 
-if [ -z "$NEW_TOKEN" ]; then
-    echo -e "${RED}Token khong duoc de trong!${NC}"
-    exit 1
-fi
+signing_key_menu() {
+    echo -e "${CYAN}${BOLD}--- Quan ly Signing Key (Ed25519) ---${NC}"
+    echo ""
+    if [ -f "$SIGNING_KEY_FILE" ] && [ -s "$SIGNING_KEY_FILE" ]; then
+        echo -e "${YELLOW}Public key hien tai:${NC} $(print_public_key 2>/dev/null)"
+    else
+        echo -e "${YELLOW}Chua co signing key nao.${NC}"
+    fi
+    echo ""
+    echo "  1) Export private key (dang base64) - de dung chung voi VPS khac"
+    echo "  2) Import private key (dang base64) - tu VPS khac"
+    echo "  3) Quay lai"
+    echo ""
+    read -p "Chon [1-3]: " SK_CHOICE
+    echo ""
+    case "$SK_CHOICE" in
+        1)
+            if [ ! -f "$SIGNING_KEY_FILE" ] || [ ! -s "$SIGNING_KEY_FILE" ]; then
+                echo -e "${RED}Chua co signing key nao de export.${NC}"
+                return
+            fi
+            EXPORTED=$(base64 -w0 "$SIGNING_KEY_FILE")
+            echo -e "${GREEN}${BOLD}Private key (base64) - GIU BI MAT:${NC}"
+            echo -e "${CYAN}$EXPORTED${NC}"
+            echo ""
+            echo -e "${YELLOW}Copy chuoi tren, chay 'mtunnel-token' tren VPS khac, chon${NC}"
+            echo -e "${YELLOW}muc Signing Key -> Import, paste vao.${NC}"
+            ;;
+        2)
+            echo -e "${YELLOW}Canh bao: se GHI DE signing key hien tai (neu co).${NC}"
+            echo -e "${YELLOW}Public key cu se khong con verify duoc chu ky server nay nua.${NC}"
+            echo ""
+            read -p "Paste private key (base64) can import: " IMPORT_B64
+            if [ -z "$IMPORT_B64" ]; then
+                echo -e "${RED}Khong duoc de trong!${NC}"
+                return
+            fi
+            VALID=$(python3 - << PYEOF
+import base64
+try:
+    raw = base64.b64decode("$IMPORT_B64")
+    if len(raw) != 32:
+        print("invalid_length")
+    else:
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+        Ed25519PrivateKey.from_private_bytes(raw)
+        print("ok")
+except Exception as e:
+    print("invalid:" + str(e))
+PYEOF
+)
+            if [ "$VALID" != "ok" ]; then
+                echo -e "${RED}Key khong hop le: $VALID${NC}"
+                return
+            fi
+            python3 -c "
+import base64
+raw = base64.b64decode('$IMPORT_B64')
+with open('$SIGNING_KEY_FILE', 'wb') as f:
+    f.write(raw)
+"
+            chmod 600 "$SIGNING_KEY_FILE"
+            chown www-data:www-data "$SIGNING_KEY_FILE" 2>/dev/null || true
+            systemctl restart mtunnel-license 2>/dev/null || true
+            echo -e "${GREEN}✅ Da import. Public key moi:${NC} $(print_public_key 2>/dev/null)"
+            echo -e "${YELLOW}Nho cap nhat lai public key nay trong app neu khac ban cu.${NC}"
+            ;;
+        3) return ;;
+        *) echo -e "${RED}Lua chon khong hop le.${NC}" ;;
+    esac
+}
 
-echo "$NEW_TOKEN" > "$TOKEN_FILE"
-chmod 600 "$TOKEN_FILE"
-chown www-data:www-data "$TOKEN_FILE" 2>/dev/null || true
-systemctl restart mtunnel-license 2>/dev/null || true
+while true; do
+    show_header
+    echo -e "${CYAN}Chon thao tac:${NC}"
+    echo "  1) Doi token (thu hoi tat ca app dang dung token cu ngay lap tuc)"
+    echo "  2) Xem Server Public Key (Ed25519 - verify chu ky /api/config)"
+    echo "  3) Xem TLS Pin (dung cho pinning HTTPS ben app)"
+    echo "  4) Xem trang thai server (/health)"
+    echo "  5) Xem log realtime (Ctrl+C de quay lai menu)"
+    echo "  6) Restart service"
+    echo "  7) Quan ly Signing Key (Export/Import giua cac VPS)"
+    echo "  8) Thoat"
+    echo ""
+    read -p "Nhap lua chon [1-8]: " CHOICE
+    echo ""
 
-echo ""
-echo -e "${GREEN}${BOLD}✅ Token da cap nhat thanh cong!${NC}"
-echo -e "   Token   : ${NEW_TOKEN:0:8}...${NEW_TOKEN: -4}"
-echo -e "   Package : $PACKAGE"
-echo ""
-echo "Lenh quan ly:"
-echo "  Xem log  : journalctl -u mtunnel-license -f"
-echo "  Doi token: mtunnel-token"
-echo ""
+    case "$CHOICE" in
+        1)
+            echo -e "${CYAN}Huong dan lay token:${NC}"
+            echo "  1. Build release APK (cung keystore)"
+            echo "  2. Chay app tren thiet bi"
+            echo "  3. Token hien trong AlertDialog luc khoi dong"
+            echo "  4. Copy token roi paste vao day"
+            echo ""
+            read -p "Nhap token moi: " NEW_TOKEN
+            if [ -z "$NEW_TOKEN" ]; then
+                echo -e "${RED}Token khong duoc de trong!${NC}"
+            else
+                echo "$NEW_TOKEN" > "$TOKEN_FILE"
+                chmod 600 "$TOKEN_FILE"
+                chown www-data:www-data "$TOKEN_FILE" 2>/dev/null || true
+                systemctl restart mtunnel-license 2>/dev/null || true
+                echo -e "${GREEN}✅ Token da cap nhat: ${NEW_TOKEN:0:8}...${NEW_TOKEN: -4}${NC}"
+            fi
+            ;;
+        2)
+            echo -e "${CYAN}Server Public Key (Ed25519):${NC}"
+            echo -e "  ${BOLD}$(print_public_key 2>/dev/null)${NC}"
+            echo -e "${YELLOW}(dan vao SERVER_PUBLIC_KEYS_B64[] ben Android)${NC}"
+            ;;
+        3)
+            if [ -x "$INSTALL_DIR/print_tlspin.sh" ]; then
+                "$INSTALL_DIR/print_tlspin.sh"
+            else
+                echo -e "${RED}Chua co script print_tlspin.sh — cai dat lai hoac tao thu cong.${NC}"
+            fi
+            ;;
+        4)
+            echo -e "${CYAN}Trang thai server (port $SSL_PORT):${NC}"
+            curl -s "https://127.0.0.1:$SSL_PORT/health" -k || echo -e "${RED}Khong ket noi duoc toi server.${NC}"
+            echo ""
+            ;;
+        5)
+            echo -e "${YELLOW}Dang xem log realtime — nhan Ctrl+C de quay lai menu${NC}"
+            echo ""
+            journalctl -u mtunnel-license -f
+            ;;
+        6)
+            systemctl restart mtunnel-license
+            sleep 1
+            if systemctl is-active --quiet mtunnel-license; then
+                echo -e "${GREEN}✅ Service da restart thanh cong.${NC}"
+            else
+                echo -e "${RED}Service khong khoi dong duoc — xem: journalctl -u mtunnel-license -e${NC}"
+            fi
+            ;;
+        7)
+            signing_key_menu
+            ;;
+        8)
+            echo "Tam biet."
+            exit 0
+            ;;
+        *)
+            echo -e "${RED}Lua chon khong hop le.${NC}"
+            ;;
+    esac
+    pause
+done
 TKEOF
 
-chmod +x "$INSTALL_DIR/update_token.sh"
-ln -sf "$INSTALL_DIR/update_token.sh" /usr/local/bin/mtunnel-token
-log "Script quan ly token da tao — lenh: mtunnel-token"
+chmod +x "$INSTALL_DIR/mtunnel-menu.sh"
+ln -sf "$INSTALL_DIR/mtunnel-menu.sh" /usr/local/bin/mtunnel-token
+log "Menu quan ly tong hop da tao — go 'mtunnel-token' de mo (doi token/pubkey/TLS pin/health/log/restart/signing-key)"
 
 # ── 6. Systemd service ──────────────────────────────────────
 log "Tao systemd service..."
@@ -222,9 +496,14 @@ systemctl start mtunnel-license
 log "Service da khoi dong"
 
 # ── 6b. Tạo script hiển thị Server Public Key (Ed25519) ─────
+# LUU Y: script nay CHI in ra key dung de verify CHU KY /api/config
+# (Ed25519, tach biet hoan toan voi chung chi TLS). KHONG dung gia tri
+# nay lam TLS pin — xem muc "TLS_PINNED_PUBKEY_SHA256" duoc in rieng
+# o buoc 8d ben duoi, do 2 loai key nay khac nhau hoan toan va tron
+# ten voi nhau la nguyen nhan gay loi config khong tai duoc ve truoc day.
 cat > "$INSTALL_DIR/print_pubkey.py" << 'PYEOF'
 #!/usr/bin/env python3
-import base64, hashlib, sys
+import base64, sys
 
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from cryptography.hazmat.primitives import serialization
@@ -244,148 +523,14 @@ pub_raw = key.public_key().public_bytes(
     format=serialization.PublicFormat.Raw
 )
 
+# Chi 1 gia tri duy nhat - dung de verify CHU KY config, KHONG lien quan TLS
 print(f"SERVER_PUBLIC_KEY_B64={base64.b64encode(pub_raw).decode()}")
+print("(Gia tri nay dung cho SERVER_PUBLIC_KEYS_B64[] ben Android, de verify chu ky /api/config.")
+print(" KHONG dung cho TLS pin — chay 'mtunnel-tlspin' de lay TLS pin rieng.)")
 PYEOF
 chmod +x "$INSTALL_DIR/print_pubkey.py"
 ln -sf "$INSTALL_DIR/print_pubkey.py" /usr/local/bin/mtunnel-pubkey
-log "Script hien thi public key da tao — lenh: mtunnel-pubkey"
-
-# ── 6d. Tao script quan ly signing key (export/import giua cac VPS) ─
-log "Tao script quan ly signing key..."
-cat > "$INSTALL_DIR/manage_signing_key.sh" << 'SIGNKEYEOF'
-#!/bin/bash
-GREEN='\033[0;32m'
-CYAN='\033[0;36m'
-YELLOW='\033[1;33m'
-RED='\033[0;31m'
-BOLD='\033[1m'
-NC='\033[0m'
-
-INSTALL_DIR="/opt/mtunnel"
-SIGNING_KEY_FILE="$INSTALL_DIR/.signing_key"
-
-# In public key (base64) tương ứng với private key hiện có trong SIGNING_KEY_FILE
-print_public_key() {
-    python3 - << PYEOF
-import base64
-from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
-from cryptography.hazmat.primitives import serialization
-
-with open("$SIGNING_KEY_FILE", "rb") as f:
-    raw = f.read()
-key = Ed25519PrivateKey.from_private_bytes(raw)
-pub = key.public_key().public_bytes(
-    encoding=serialization.Encoding.Raw,
-    format=serialization.PublicFormat.Raw
-)
-print(base64.b64encode(pub).decode())
-PYEOF
-}
-
-clear
-echo ""
-echo -e "${GREEN}${BOLD}═══════════════════════════════════════════${NC}"
-echo -e "${GREEN}${BOLD}   MTunnel - Quan ly Signing Key (Ed25519)  ${NC}"
-echo -e "${GREEN}${BOLD}═══════════════════════════════════════════${NC}"
-echo ""
-
-if [ -f "$SIGNING_KEY_FILE" ] && [ -s "$SIGNING_KEY_FILE" ]; then
-    CURRENT_PUB=$(print_public_key 2>/dev/null)
-    echo -e "${YELLOW}Signing key hien tai:${NC}"
-    echo -e "  Public key: ${CYAN}$CURRENT_PUB${NC}"
-else
-    echo -e "${YELLOW}Chua co signing key nao (se tu sinh khi server chay lan dau).${NC}"
-fi
-echo ""
-
-echo -e "${CYAN}Chon thao tac:${NC}"
-echo "  1) Xem private key (dang base64) - de EXPORT sang VPS khac"
-echo "  2) Nhap private key (dang base64) - de IMPORT tu VPS khac"
-echo "  3) Thoat, khong doi gi"
-echo ""
-read -p "Nhap lua chon [1-3]: " CHOICE
-
-case "$CHOICE" in
-    1)
-        if [ ! -f "$SIGNING_KEY_FILE" ] || [ ! -s "$SIGNING_KEY_FILE" ]; then
-            echo -e "${RED}Chua co signing key nao de export. Khoi dong server 1 lan de no tu sinh key truoc.${NC}"
-            exit 1
-        fi
-        EXPORTED=$(base64 -w0 "$SIGNING_KEY_FILE")
-        echo ""
-        echo -e "${GREEN}${BOLD}Private key (base64) - GIU BI MAT, khong dang public o dau:${NC}"
-        echo -e "${CYAN}$EXPORTED${NC}"
-        echo ""
-        echo -e "${YELLOW}Cach dung: copy chuoi tren, chay 'mtunnel-signing-key' tren VPS khac,${NC}"
-        echo -e "${YELLOW}chon '2) Nhap private key', roi paste chuoi nay vao.${NC}"
-        ;;
-    2)
-        echo ""
-        echo -e "${YELLOW}Canh bao: thao tac nay se GHI DE signing key hien tai (neu co).${NC}"
-        echo -e "${YELLOW}App dang dung public key CU se KHONG con verify duoc chu ky server nay nua${NC}"
-        echo -e "${YELLOW}cho toi khi ban cap nhat lai public key moi trong app.${NC}"
-        echo ""
-        read -p "Paste private key (base64) can import: " IMPORT_B64
-
-        if [ -z "$IMPORT_B64" ]; then
-            echo -e "${RED}Khong duoc de trong!${NC}"
-            exit 1
-        fi
-
-        # Validate: phải decode được base64 và đúng 32 byte (Ed25519 raw private key)
-        VALID=$(python3 - << PYEOF
-import base64, sys
-try:
-    raw = base64.b64decode("$IMPORT_B64")
-    if len(raw) != 32:
-        print("invalid_length")
-    else:
-        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
-        Ed25519PrivateKey.from_private_bytes(raw)  # thử load, lỗi thì raise exception
-        print("ok")
-except Exception as e:
-    print("invalid:" + str(e))
-PYEOF
-)
-        if [ "$VALID" != "ok" ]; then
-            echo -e "${RED}Key khong hop le: $VALID${NC}"
-            echo -e "${RED}Phai la key export tu 'mtunnel-signing-key' (option 1) tren VPS khac.${NC}"
-            exit 1
-        fi
-
-        python3 -c "
-import base64
-raw = base64.b64decode('$IMPORT_B64')
-with open('$SIGNING_KEY_FILE', 'wb') as f:
-    f.write(raw)
-"
-        chmod 600 "$SIGNING_KEY_FILE"
-        chown www-data:www-data "$SIGNING_KEY_FILE" 2>/dev/null || true
-        systemctl restart mtunnel-license 2>/dev/null || true
-
-        NEW_PUB=$(print_public_key 2>/dev/null)
-        echo ""
-        echo -e "${GREEN}${BOLD}✅ Signing key da import thanh cong!${NC}"
-        echo -e "   Public key: ${CYAN}$NEW_PUB${NC}"
-        echo ""
-        echo -e "${YELLOW}Public key nay phai KHOP voi public key da khai bao trong app${NC}"
-        echo -e "${YELLOW}(ConfigClientNative.java -> SERVER_PUBLIC_KEYS_B64) cho server nay.${NC}"
-        ;;
-    3)
-        echo "Thoat, khong doi gi."
-        exit 0
-        ;;
-    *)
-        echo -e "${RED}Lua chon khong hop le.${NC}"
-        exit 1
-        ;;
-esac
-echo ""
-
-SIGNKEYEOF
-chmod +x "$INSTALL_DIR/manage_signing_key.sh"
-ln -sf "$INSTALL_DIR/manage_signing_key.sh" /usr/local/bin/mtunnel-signing-key
-log "Script quan ly signing key da tao — lenh: mtunnel-signing-key"
+log "Script hien thi signing pubkey da tao — lenh: mtunnel-pubkey"
 
 # ── 6c. Doi signing key duoc tao (server tao luc khoi dong) ─
 log "Doi service tao signing key..."
@@ -400,6 +545,29 @@ if [ -f "$INSTALL_DIR/.signing_key" ]; then
 else
     warn "Khong thay signing key sau 10s — kiem tra: journalctl -u mtunnel-license -e"
     SERVER_PUBLIC_KEY_B64="(chua co - chay 'mtunnel-pubkey' sau)"
+fi
+
+# ── 6d. Hoi rieng ve Cloudflare Proxy — anh huong TRUC TIEP toi TLS
+#        pin (khac hoan toan voi signing key o tren). Neu domain bat
+#        Proxy (orange cloud), client se bat tay TLS voi CHUNG CHI CUA
+#        CLOUDFLARE (vd Google Trust Services), khong phai chung chi
+#        cua VPS nay — nen KHONG THE tinh pin cuc bo tren may nay duoc,
+#        phai lay tu ben ngoai sau khi cai xong.
+CF_PROXIED="n"
+if [ "$SSL_METHOD" = "1" ]; then
+    echo ""
+    echo -e "${CYAN}${BOLD}--- Cloudflare Proxy status cho domain nay ---${NC}"
+    echo -e "${YELLOW}Vao Cloudflare Dashboard > DNS, xem dong ban ghi cua domain nay${NC}"
+    echo -e "${YELLOW}(hoac ban ghi wildcard *.domain neu khong co dong rieng):${NC}"
+    echo -e "${YELLOW}  - May xam (DNS only)  -> chon 'k'${NC}"
+    echo -e "${YELLOW}  - May cam (Proxied)   -> chon 'c'${NC}"
+    printf "${CYAN}Domain nay dang Proxied (cam) tren Cloudflare?${NC} (c/k) [k]: "
+    read CF_PROXIED_ANS
+    if [ "$CF_PROXIED_ANS" = "c" ] || [ "$CF_PROXIED_ANS" = "C" ]; then
+        CF_PROXIED="y"
+        warn "Domain Proxied — TLS pin PHAI lay tu ben ngoai sau khi cai xong (xem huong dan cuoi script)."
+        warn "Cert client thay se la cert cua Cloudflare (dung chung cho ca zone), co the doi theo chu ky renew cua Cloudflare."
+    fi
 fi
 
 # ── 7a. Do cong SSL (port 80/443 co the da bi service khac nhu ────
@@ -423,47 +591,86 @@ else
     log "Se dung port $SSL_PORT cho HTTPS thay vi 443"
 fi
 
-# ── 7b. Luu Cloudflare credentials cho certbot dns plugin ────
-mkdir -p /root/.secrets/certbot
-cat > /root/.secrets/certbot/cloudflare.ini << CFEOF
+# Luu SSL_PORT vao .config de cac lenh quan ly sau nay (mtunnel-token menu)
+# doc lai duoc — luc ghi CONFIG_FILE lan dau (buoc 3) chua biet port nay.
+echo "SSL_PORT=$SSL_PORT" >> "$CONFIG_FILE"
+
+# ── 7b/8a. Lay chung chi SSL theo phuong thuc da chon ────────
+if [ "$SSL_METHOD" = "1" ]; then
+    # Luu Cloudflare credentials cho certbot dns plugin
+    mkdir -p /root/.secrets/certbot
+    cat > /root/.secrets/certbot/cloudflare.ini << CFEOF
 dns_cloudflare_api_token = $CF_TOKEN
 CFEOF
-chmod 600 /root/.secrets/certbot/cloudflare.ini
+    chmod 600 /root/.secrets/certbot/cloudflare.ini
 
-# ── 8a. Xin chung chi SSL qua DNS-01 (khong can port 80/443) ─
-# Vi psiphond dang chiem dung ca port 80 va co the ca 443, HTTP-01
-# challenge (can port 80 mo) khong the dung duoc. DNS-01 challenge
-# xac thuc qua ban ghi TXT tren Cloudflare, hoan toan khong dung
-# den port 80/443 cua may chu, nen tranh duoc xung dot nay.
-log "Xin SSL certificate cho $DOMAIN (DNS-01 qua Cloudflare)..."
-# --reuse-key: QUAN TRONG cho TLS pinning — neu khong co flag nay, moi lan
-# certbot renew (tu dong, ~60-90 ngay/lan) se tao private key MOI, khien
-# TLS pin (CURLOPT_PINNEDPUBLICKEY trong app) doi theo va app se bi tu choi
-# ket noi cho toi khi ai do nhan ra va cap nhat lai pin. Giu --reuse-key de
-# key (va pin) on dinh xuyen suot vong doi domain.
-if ! certbot certonly --dns-cloudflare \
-    --dns-cloudflare-credentials /root/.secrets/certbot/cloudflare.ini \
-    --dns-cloudflare-propagation-seconds 30 \
-    --reuse-key \
-    -d "$DOMAIN" --email "$EMAIL" --agree-tos --non-interactive > /tmp/certbot.log 2>&1; then
-    error "Cap SSL that bai. Chi tiet: cat /tmp/certbot.log (thuong do Cloudflare API Token sai quyen, hoac domain $DOMAIN khong nam trong zone Cloudflare cua token nay)"
+    # Xin chung chi SSL qua DNS-01 (khong can port 80/443). Vi psiphond
+    # dang chiem dung ca port 80 va co the ca 443, HTTP-01 challenge
+    # (can port 80 mo) khong the dung duoc. DNS-01 challenge xac thuc
+    # qua ban ghi TXT tren Cloudflare, hoan toan khong dung den port
+    # 80/443 cua may chu, nen tranh duoc xung dot nay.
+    log "Xin SSL certificate cho $DOMAIN (DNS-01 qua Cloudflare)..."
+    if ! certbot certonly --dns-cloudflare \
+        --dns-cloudflare-credentials /root/.secrets/certbot/cloudflare.ini \
+        --dns-cloudflare-propagation-seconds 30 \
+        -d "$DOMAIN" --email "$EMAIL" --agree-tos --non-interactive > /tmp/certbot.log 2>&1; then
+        error "Cap SSL that bai. Chi tiet: cat /tmp/certbot.log (thuong do Cloudflare API Token sai quyen, hoac domain $DOMAIN khong nam trong zone Cloudflare cua token nay)"
+    fi
+    log "SSL da cap xong"
+
+    CERT_PATH="/etc/letsencrypt/live/$DOMAIN/fullchain.pem"
+    KEY_PATH="/etc/letsencrypt/live/$DOMAIN/privkey.pem"
+else
+    # Luu chung chi + private key nguoi dung da dan (vd Cloudflare Origin CA)
+    log "Luu chung chi SSL da dan..."
+    mkdir -p /etc/ssl/mtunnel
+    printf '%s' "$CERT_PEM" > /etc/ssl/mtunnel/fullchain.pem
+    printf '%s' "$KEY_PEM"  > /etc/ssl/mtunnel/privkey.pem
+    chmod 644 /etc/ssl/mtunnel/fullchain.pem
+    chmod 600 /etc/ssl/mtunnel/privkey.pem
+
+    if ! openssl x509 -in /etc/ssl/mtunnel/fullchain.pem -noout > /tmp/cert-check.log 2>&1; then
+        error "Chung chi khong hop le. Chi tiet: cat /tmp/cert-check.log"
+    fi
+    if ! openssl pkey -in /etc/ssl/mtunnel/privkey.pem -noout > /tmp/key-check.log 2>&1; then
+        error "Private key khong hop le. Chi tiet: cat /tmp/key-check.log"
+    fi
+
+    CERT_PUBKEY_HASH=$(openssl x509 -in /etc/ssl/mtunnel/fullchain.pem -noout -pubkey 2>/dev/null | openssl pkey -pubin -outform DER 2>/dev/null | sha256sum)
+    KEY_PUBKEY_HASH=$(openssl pkey -in /etc/ssl/mtunnel/privkey.pem -pubout -outform DER 2>/dev/null | sha256sum)
+    if [ "$CERT_PUBKEY_HASH" != "$KEY_PUBKEY_HASH" ]; then
+        error "Chung chi va Private Key KHONG khop nhau (public key khac nhau) — kiem tra lai da dan dung cap chua"
+    fi
+
+    CERT_EXPIRY=$(openssl x509 -in /etc/ssl/mtunnel/fullchain.pem -noout -enddate | cut -d= -f2)
+    log "Chung chi hop le, khop voi private key. Het han: $CERT_EXPIRY"
+
+    CERT_PATH="/etc/ssl/mtunnel/fullchain.pem"
+    KEY_PATH="/etc/ssl/mtunnel/privkey.pem"
 fi
-log "SSL da cap xong"
 
 # ── 8b. Cau hinh Nginx — chi 1 server block HTTPS tren SSL_PORT ─
 # Khong tao block "listen 80" vi port 80 dang bi service khac (vd
 # psiphond) chiem, nginx se khong the bind duoc port do.
 log "Cau hinh Nginx..."
+if [ "$SSL_METHOD" = "1" ]; then
+    SSL_EXTRA_CONF="    include /etc/letsencrypt/options-ssl-nginx.conf;
+    ssl_dhparam /etc/letsencrypt/ssl-dhparams.pem;"
+else
+    SSL_EXTRA_CONF="    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_ciphers HIGH:!aNULL:!MD5;
+    ssl_prefer_server_ciphers on;"
+fi
+
 cat > /etc/nginx/sites-available/mtunnel << NGXEOF
 server {
     listen $SSL_PORT ssl;
     listen [::]:$SSL_PORT ssl;
     server_name $DOMAIN;
 
-    ssl_certificate     /etc/letsencrypt/live/$DOMAIN/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/$DOMAIN/privkey.pem;
-    include /etc/letsencrypt/options-ssl-nginx.conf;
-    ssl_dhparam /etc/letsencrypt/ssl-dhparams.pem;
+    ssl_certificate     $CERT_PATH;
+    ssl_certificate_key $KEY_PATH;
+$SSL_EXTRA_CONF
 
     location /api/events {
         proxy_pass            http://127.0.0.1:5000;
@@ -511,53 +718,115 @@ if ! systemctl is-active --quiet nginx; then
 fi
 log "Nginx da chay HTTPS tren port $SSL_PORT"
 
-# ── 8d. Tinh TLS pin THAT tu chung chi dang chay (khong phai tu Ed25519 key) ─
-# Day la pin cho CURLOPT_PINNEDPUBLICKEY (libcurl, tang TLS) — khac hoan toan
-# voi SERVER_PUBLIC_KEY_B64 (Ed25519, tang ung dung, dung de verify chu ky
-# noi dung config). Phai do sau khi nginx da that su phuc vu HTTPS, luc nay
-# moi co cert that de tinh — khong the tinh truoc do nhu ban cu.
-log "Tinh TLS pin tu chung chi dang chay..."
-PINNED_PUBKEY_SHA256=$(echo | openssl s_client -connect "127.0.0.1:$SSL_PORT" -servername "$DOMAIN" 2>/dev/null \
-    | openssl x509 -pubkey -noout 2>/dev/null \
-    | openssl pkey -pubin -outform der 2>/dev/null \
-    | openssl dgst -sha256 -binary \
-    | base64)
-
-if [ -z "$PINNED_PUBKEY_SHA256" ]; then
-    warn "Khong tinh duoc TLS pin tu dong — chay tay sau: mtunnel-tlspin"
-    PINNED_PUBKEY_SHA256="(chua co - chay 'mtunnel-tlspin' sau)"
-else
-    PINNED_PUBKEY_SHA256="sha256//$PINNED_PUBKEY_SHA256"
-    log "TLS pin: $PINNED_PUBKEY_SHA256"
-fi
-
-# Luu lai script de tinh lai pin bat cu luc nao (vd sau khi Let's Encrypt renew
-# cert va doi sang key khac — pin se doi theo, can cap nhat lai trong app)
+# ── 8d. Tao lenh mtunnel-tlspin — TACH BIET hoan toan voi mtunnel-pubkey ──
+# mtunnel-pubkey  = Ed25519 signing key (verify chu ky /api/config)
+# mtunnel-tlspin  = pubkey hash cua CHUNG CHI TLS (dung de pin HTTPS)
+# Day la 2 khai niem khac nhau — tron 2 cai nay la nguyen nhan pho bien
+# nhat khien app khong tai duoc config du server hoat dong binh thuong.
 cat > "$INSTALL_DIR/print_tlspin.sh" << TLSPINEOF
 #!/bin/bash
-echo | openssl s_client -connect "127.0.0.1:$SSL_PORT" -servername "$DOMAIN" 2>/dev/null \\
-    | openssl x509 -pubkey -noout 2>/dev/null \\
-    | openssl pkey -pubin -outform der 2>/dev/null \\
-    | openssl dgst -sha256 -binary \\
-    | base64 | sed 's/^/sha256\\/\\//'
+DOMAIN="$DOMAIN"
+SSL_PORT="$SSL_PORT"
+SSL_METHOD="$SSL_METHOD"
+CF_PROXIED="$CF_PROXIED"
+CERT_PATH="$CERT_PATH"
+
+if [ "\$CF_PROXIED" = "y" ]; then
+    echo "Domain nay dang Proxied qua Cloudflare — KHONG THE tinh TLS pin"
+    echo "chinh xac tu chinh VPS nay (client thay cert cua Cloudflare, khac"
+    echo "voi cert goc tren VPS)."
+    echo ""
+    echo "Chay lenh sau tu MOT MAY KHAC (dien thoai 4G, laptop ca nhan —"
+    echo "KHONG phai tu VPS nay, de tranh NAT hairpin cho ket qua sai):"
+    echo ""
+    echo "  openssl s_client -connect \$DOMAIN:\$SSL_PORT </dev/null 2>/dev/null \\"
+    echo "    | openssl x509 -pubkey -noout \\"
+    echo "    | openssl pkey -pubin -outform der \\"
+    echo "    | openssl dgst -sha256 -binary \\"
+    echo "    | base64"
+    echo ""
+    echo "Ket qua la TLS_PINNED_PUBKEY_SHA256 — dan vao PINNED_PUBKEYS_SHA256[]"
+    echo "ben Android voi tien to 'sha256//'. LUU Y: vi cert nay do Cloudflare"
+    echo "quan ly (co the dung chung cho nhieu domain trong cung zone va tu"
+    echo "doi khi Cloudflare renew), can chay lai lenh nay dinh ky de kiem tra"
+    echo "pin con dung khong, dac biet neu app bao loi tai config dot ngot."
+else
+    echo "Domain KHONG proxy (DNS only) — tinh truc tiep tu chung chi cuc bo:"
+    echo ""
+    PIN=\$(openssl x509 -in "\$CERT_PATH" -noout -pubkey 2>/dev/null \\
+        | openssl pkey -pubin -outform der 2>/dev/null \\
+        | openssl dgst -sha256 -binary \\
+        | base64)
+    echo "TLS_PINNED_PUBKEY_SHA256 = sha256//\$PIN"
+    echo ""
+    echo "Dan gia tri tren vao PINNED_PUBKEYS_SHA256[] ben Android."
+fi
 TLSPINEOF
 chmod +x "$INSTALL_DIR/print_tlspin.sh"
 ln -sf "$INSTALL_DIR/print_tlspin.sh" /usr/local/bin/mtunnel-tlspin
-log "Script tinh TLS pin da tao — lenh: mtunnel-tlspin (chay lai sau moi lan renew SSL)"
+log "Script tinh TLS pin da tao — lenh: mtunnel-tlspin"
 
-# ── 8c. Auto-renew: certbot renew se tu dung lai dns-cloudflare
-#        plugin (da luu trong renewal config), khong can lam gi them.
-#        Chi can dam bao nginx reload sau khi renew thanh cong:
-if [ -f /etc/letsencrypt/renewal/$DOMAIN.conf ] && ! grep -q "renew_hook" /etc/letsencrypt/renewal/$DOMAIN.conf; then
-    echo "renew_hook = systemctl reload nginx" >> /etc/letsencrypt/renewal/$DOMAIN.conf
+# ── 8c. Auto-renew (chi ap dung cho phuong thuc 1 — Let's Encrypt):
+#        certbot renew se tu dung lai dns-cloudflare plugin (da luu
+#        trong renewal config). Chi can dam bao nginx reload sau renew.
+#        Phuong thuc 2 (tu dan chung chi) khong can renew tu dong —
+#        chung chi Origin CA thuong co han rat dai (vd 15 nam).
+if [ "$SSL_METHOD" = "1" ]; then
+    if [ -f /etc/letsencrypt/renewal/$DOMAIN.conf ] && ! grep -q "renew_hook" /etc/letsencrypt/renewal/$DOMAIN.conf; then
+        echo "renew_hook = systemctl reload nginx" >> /etc/letsencrypt/renewal/$DOMAIN.conf
+    fi
+
+    # Vi certbot gio nam trong pip venv (khong phai apt), goi apt khong tu
+    # tao san cron/systemd timer de renew nhu binh thuong -> tu tao rieng.
+    log "Tao systemd timer tu-gia-han SSL..."
+    cat > /etc/systemd/system/certbot-renew.service << RENEWSVCEOF
+[Unit]
+Description=Certbot renew (mtunnel, pip venv)
+
+[Service]
+Type=oneshot
+ExecStart=$CERTBOT_VENV/bin/certbot renew --quiet
+RENEWSVCEOF
+
+    cat > /etc/systemd/system/certbot-renew.timer << RENEWTIMEREOF
+[Unit]
+Description=Chay certbot renew 2 lan/ngay (mtunnel)
+
+[Timer]
+OnCalendar=*-*-* 00,12:00:00
+RandomizedDelaySec=3600
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+RENEWTIMEREOF
+
+    systemctl daemon-reload
+    systemctl enable --now certbot-renew.timer
+    log "Timer tu-gia-han da bat: systemctl list-timers certbot-renew.timer"
 fi
 
-# ── 9. Mở giao diện thiết lập token ────────────────────────
+# ── 9. Thiết lập token lần đầu ───────────────────────────────
 echo ""
 echo -e "${YELLOW}${BOLD}═══════════════════════════════════════════${NC}"
 echo -e "${YELLOW}${BOLD}   Buoc cuoi: Thiet lap Token              ${NC}"
 echo -e "${YELLOW}${BOLD}═══════════════════════════════════════════${NC}"
-bash "$INSTALL_DIR/update_token.sh"
+echo -e "${CYAN}Huong dan lay token:${NC}"
+echo "  1. Build release APK (cung keystore)"
+echo "  2. Chay app tren thiet bi"
+echo "  3. Token hien trong AlertDialog luc khoi dong"
+echo "  4. Copy token roi paste vao day"
+echo ""
+read -p "Nhap token (Enter de bo qua, thiet lap sau bang 'mtunnel-token'): " NEW_TOKEN
+if [ -n "$NEW_TOKEN" ]; then
+    echo "$NEW_TOKEN" > "$TOKEN_FILE"
+    chmod 600 "$TOKEN_FILE"
+    chown www-data:www-data "$TOKEN_FILE" 2>/dev/null || true
+    systemctl restart mtunnel-license 2>/dev/null || true
+    log "Token da thiet lap: ${NEW_TOKEN:0:8}...${NEW_TOKEN: -4}"
+else
+    warn "Bo qua — /api/verify va /api/config se tra loi 'server_not_configured' cho toi khi chay 'mtunnel-token' de thiet lap."
+fi
 
 # ── Hoàn tất ────────────────────────────────────────────────
 echo ""
@@ -570,25 +839,39 @@ echo -e "  ⚙️  Config URL : ${BOLD}https://$DOMAIN:$SSL_PORT/api/config${NC}
 echo -e "  📡 SSE URL    : ${BOLD}https://$DOMAIN:$SSL_PORT/api/events${NC}"
 echo -e "  📦 Package    : ${BOLD}$PACKAGE${NC}"
 echo ""
-echo -e "${YELLOW}${BOLD}Nhung vao app Android (de verify chu ky /api/config):${NC}"
+echo -e "${YELLOW}${BOLD}[1/2] Ed25519 signing key — de verify CHU KY /api/config:${NC}"
 echo -e "  SERVER_PUBLIC_KEY_B64 : ${BOLD}$SERVER_PUBLIC_KEY_B64${NC}"
-echo -e "  PINNED_PUBKEY_SHA256  : ${BOLD}$PINNED_PUBKEY_SHA256${NC}"
+echo -e "  (dan vao SERVER_PUBLIC_KEYS_B64[] ben Android)"
 echo ""
-echo -e "${CYAN}Lenh quan ly:${NC}"
-echo -e "  📋 Xem log    : journalctl -u mtunnel-license -f"
-echo -e "  🔑 Doi token  : mtunnel-token"
-echo -e "  🔐 Xem pubkey : mtunnel-pubkey"
-echo -e "  🔄 Restart    : systemctl restart mtunnel-license"
-echo -e "  📊 Status SSE : curl https://$DOMAIN:$SSL_PORT/health"
+echo -e "${YELLOW}${BOLD}[2/2] TLS certificate pin — DE RIENG, KHAC HOAN TOAN voi key o tren:${NC}"
+if [ "$CF_PROXIED" = "y" ]; then
+    echo -e "  Domain dang Proxied qua Cloudflare — KHONG tinh duoc tai day."
+    echo -e "  Chay lenh ${BOLD}mtunnel-tlspin${NC} de xem huong dan lay pin tu ben ngoai."
+else
+    TLSPIN_NOW=$("$INSTALL_DIR/print_tlspin.sh" 2>/dev/null | grep '^TLS_PINNED_PUBKEY_SHA256' || true)
+    echo -e "  ${BOLD}$TLSPIN_NOW${NC}"
+    echo -e "  (dan vao PINNED_PUBKEYS_SHA256[] ben Android)"
+fi
 echo ""
-echo -e "${CYAN}Admin API (dung server token lam admin_key):${NC}"
-echo -e "  Thu hoi license:"
-echo -e "  ${BOLD}curl -X POST https://$DOMAIN:$SSL_PORT/api/admin/revoke \\${NC}"
-echo -e "  ${BOLD}  -H 'Content-Type: application/json' \\${NC}"
-echo -e "  ${BOLD}  -d '{"admin_key":"TOKEN","token":"TOKEN_APP"}'${NC}"
+if [ "$SSL_METHOD" = "2" ]; then
+    echo -e "${YELLOW}${BOLD}⚠️  Luu y ve chung chi tu dan (vd Cloudflare Origin CA):${NC}"
+    echo -e "  Chung chi nay KHONG duoc he thong/trinh duyet tin cay mac dinh."
+    echo -e "  App phai tu pin chung chi nay (hoac root CA cua no) trong"
+    echo -e "  network_security_config.xml, neu khong ket noi HTTPS se that bai."
+    echo -e "  Het han: ${BOLD}$CERT_EXPIRY${NC}"
+    echo -e "  Chung chi Origin CA CHI hop le neu domain o che do DNS only —"
+    echo -e "  neu ban dang bat Proxy (Cloudflare cam), client se KHONG BAO GIO"
+    echo -e "  thay chung chi nay, setup se khong hoat dong dung."
+    echo ""
+fi
+echo -e "${CYAN}${BOLD}Quan ly server — chi can nho 1 lenh duy nhat:${NC}"
+echo -e "  ${BOLD}mtunnel-token${NC}  ← mo menu: doi token / xem pubkey / TLS pin /"
+echo -e "                  health / log / restart / signing-key export-import"
 echo ""
-echo -e "  Revoke tat ca app:"
-echo -e "  ${BOLD}curl -X POST https://$DOMAIN:$SSL_PORT/api/admin/revoke \\${NC}"
-echo -e "  ${BOLD}  -H 'Content-Type: application/json' \\${NC}"
-echo -e "  ${BOLD}  -d '{"admin_key":"TOKEN","token":""}'${NC}"
+echo -e "  Port dang dung : ${BOLD}$SSL_PORT${NC} $([ "$SSL_PORT" != "443" ] && echo "(khac 443 vi port 443 dang bi service khac chiem)")"
+echo -e "  Xem log truc tiep (khong qua menu): journalctl -u mtunnel-license -f"
+echo ""
+echo -e "${CYAN}Thu hoi license:${NC}"
+echo -e "  Server hien chi ho tro MOT token dung chung cho toan bo app."
+echo -e "  De thu hoi tat ca app dang dung token cu: chay ${BOLD}mtunnel-token${NC} → chon muc 1"
 echo ""
