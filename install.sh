@@ -79,38 +79,51 @@ if [ "$SSL_METHOD" = "1" ]; then
     [ -z "$CF_TOKEN" ] && error "Can Cloudflare API Token de xin SSL qua DNS-01 (khong the dung port 80/443)"
     echo ""
 else
-    echo -e "${CYAN}${BOLD}--- Dan chung chi SSL co san (vd: Cloudflare Origin CA) ---${NC}"
+    echo -e "${CYAN}${BOLD}--- Chung chi SSL co san (vd: Cloudflare Origin CA) ---${NC}"
     echo -e "${YELLOW}Tao tai: Cloudflare dashboard > SSL/TLS > Origin Server > Create Certificate${NC}"
     echo -e "${YELLOW}Luu y: Origin CA cert CHI duoc Cloudflare edge tin cay, khong duoc trinh${NC}"
     echo -e "${YELLOW}duyet/OS tin cay mac dinh. App Android ket noi thang toi VPS se can tu${NC}"
     echo -e "${YELLOW}pin chung chi nay (hoac root CA cua no) trong network_security_config.${NC}"
     echo ""
-    read_pem_block() {
-        # Doc tung dong va tu dung lai NGAY KHI gap dong ket thuc PEM
-        # (vd -----END CERTIFICATE----- hoac -----END PRIVATE KEY-----),
-        # khong yeu cau nguoi dung go them dong "END" nao ca — dan xong
-        # (Ctrl+Shift+V / chuot phai) la script tu chay tiep.
+
+    read_pem_until_blank_line() {
+        # Doc nhieu dong, tu dung lai khi gap MOT DONG TRONG (bam Enter
+        # them 1 lan sau khi dan). Bo qua dong trong o DAU (phong khi
+        # nguoi dung lo bam Enter truoc khi dan). Cach nay khong phu
+        # thuoc vao dinh dang PEM cu the (RSA/EC/PKCS8...) hay cach
+        # terminal xu ly dong cuoi, nen chac chan hon nhieu so voi do
+        # tim chuoi "-----END...-----".
         local content="" line
         while IFS= read -r line; do
+            if [ -z "$line" ]; then
+                [ -n "$content" ] && break
+                continue
+            fi
             content+="$line"$'\n'
-            case "$line" in
-                *"-----END CERTIFICATE-----"*)          break ;;
-                *"-----END PRIVATE KEY-----"*)           break ;;
-                *"-----END RSA PRIVATE KEY-----"*)       break ;;
-                *"-----END EC PRIVATE KEY-----"*)        break ;;
-            esac
         done
         printf '%s' "$content"
     }
-    echo -e "${CYAN}Dan noi dung Origin Certificate (PEM) roi Enter — tu dung khi gap dong -----END CERTIFICATE-----:${NC}"
-    CERT_PEM=$(read_pem_block)
+
+    echo -e "${CYAN}Buoc 1/2 — Dan noi dung Origin Certificate (PEM):${NC}"
+    echo -e "${YELLOW}Dan toan bo (ca dong BEGIN va END), roi bam Enter THEM 1 LAN NUA${NC}"
+    echo -e "${YELLOW}(de lai 1 dong trong) — script se tu nhan biet va chuyen tiep.${NC}"
     echo ""
-    echo -e "${CYAN}Dan noi dung Private Key (PEM) roi Enter — tu dung khi gap dong -----END ...PRIVATE KEY-----:${NC}"
-    KEY_PEM=$(read_pem_block)
+    CERT_PEM=$(read_pem_until_blank_line)
+    [ -z "$CERT_PEM" ] && error "Chua nhan duoc noi dung Certificate nao — chay lai script va dan lai"
+    echo -e "${GREEN}Da nhan Certificate (${NC}$(echo "$CERT_PEM" | wc -l)${GREEN} dong).${NC}"
     echo ""
 
-    echo "$CERT_PEM" | grep -q "BEGIN CERTIFICATE" || error "Noi dung dan vao khong giong chung chi PEM hop le (thieu BEGIN CERTIFICATE)"
-    echo "$KEY_PEM" | grep -qE "BEGIN (RSA |EC )?PRIVATE KEY" || error "Noi dung dan vao khong giong private key PEM hop le (thieu BEGIN ... PRIVATE KEY)"
+    echo -e "${CYAN}Buoc 2/2 — Dan noi dung Private Key (PEM):${NC}"
+    echo -e "${YELLOW}Dan toan bo (ca dong BEGIN va END), roi bam Enter THEM 1 LAN NUA${NC}"
+    echo -e "${YELLOW}(de lai 1 dong trong) — script se tu nhan biet va chuyen tiep.${NC}"
+    echo ""
+    KEY_PEM=$(read_pem_until_blank_line)
+    [ -z "$KEY_PEM" ] && error "Chua nhan duoc noi dung Private Key nao — chay lai script va dan lai"
+    echo -e "${GREEN}Da nhan Private Key (${NC}$(echo "$KEY_PEM" | wc -l)${GREEN} dong).${NC}"
+    echo ""
+
+    echo "$CERT_PEM" | grep -q "BEGIN CERTIFICATE" || error "Noi dung Certificate khong hop le (thieu dong BEGIN CERTIFICATE) — chay lai script va dan lai"
+    echo "$KEY_PEM" | grep -qE "BEGIN (RSA |EC )?PRIVATE KEY" || error "Noi dung Private Key khong hop le (thieu dong BEGIN ... PRIVATE KEY) — chay lai script va dan lai"
 fi
 
 # ── Nhập cấu hình GitHub cho /api/config (tùy chọn) ─────────
