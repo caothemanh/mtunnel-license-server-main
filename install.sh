@@ -35,18 +35,74 @@ echo ""
 # ── Nhập thông tin cài đặt ──────────────────────────────────
 printf "${CYAN}Nhap domain${NC} [vd: license.example.com]: "
 read DOMAIN
-printf "${CYAN}Nhap email${NC} [cho SSL cert]: "
-read EMAIL
 printf "${CYAN}Nhap package name${NC} [vd: com.example.app]: "
 read PACKAGE
 
 [ -z "$DOMAIN"  ] && error "Domain khong duoc de trong"
-[ -z "$EMAIL"   ] && error "Email khong duoc de trong"
 [ -z "$PACKAGE" ] && error "Package name khong duoc de trong"
 
 echo ""
 info "Token se duoc thiet lap sau khi cai dat xong"
 echo ""
+
+# ── Chon phuong thuc lay chung chi SSL ──────────────────────
+echo -e "${CYAN}${BOLD}--- Chung chi SSL ---${NC}"
+echo "  1) Let's Encrypt tu dong qua Cloudflare DNS-01 (certbot, can Cloudflare API Token)"
+echo "  2) Tu dan chung chi co san (vd: Cloudflare Origin CA certificate)"
+echo ""
+printf "${CYAN}Chon${NC} (1/2) [1]: "
+read SSL_METHOD
+SSL_METHOD=${SSL_METHOD:-1}
+[ "$SSL_METHOD" != "1" ] && [ "$SSL_METHOD" != "2" ] && error "Lua chon khong hop le"
+echo ""
+
+EMAIL=""
+CF_TOKEN=""
+CERT_PEM=""
+KEY_PEM=""
+
+if [ "$SSL_METHOD" = "1" ]; then
+    printf "${CYAN}Nhap email${NC} [cho SSL cert]: "
+    read EMAIL
+    [ -z "$EMAIL" ] && error "Email khong duoc de trong"
+    echo ""
+
+    # DNS-01 challenge duoc dung thay vi HTTP-01 vi khong can port 80,
+    # tranh xung dot voi cac service khac (vd psiphond) da chiem port 80/443.
+    echo -e "${CYAN}${BOLD}--- Cloudflare API Token (de xin SSL, khong can port 80) ---${NC}"
+    echo -e "${YELLOW}Tao tai: https://dash.cloudflare.com/profile/api-tokens${NC}"
+    echo -e "${YELLOW}Dung template 'Edit zone DNS', gioi han vao đúng zone cua domain ban dung${NC}"
+    echo ""
+    printf "${CYAN}Cloudflare API Token${NC} (an khi go): "
+    read -s CF_TOKEN
+    echo ""
+    [ -z "$CF_TOKEN" ] && error "Can Cloudflare API Token de xin SSL qua DNS-01 (khong the dung port 80/443)"
+    echo ""
+else
+    echo -e "${CYAN}${BOLD}--- Dan chung chi SSL co san (vd: Cloudflare Origin CA) ---${NC}"
+    echo -e "${YELLOW}Tao tai: Cloudflare dashboard > SSL/TLS > Origin Server > Create Certificate${NC}"
+    echo -e "${YELLOW}Luu y: Origin CA cert CHI duoc Cloudflare edge tin cay, khong duoc trinh${NC}"
+    echo -e "${YELLOW}duyet/OS tin cay mac dinh. App Android ket noi thang toi VPS se can tu${NC}"
+    echo -e "${YELLOW}pin chung chi nay (hoac root CA cua no) trong network_security_config.${NC}"
+    echo ""
+    read_multiline_pem() {
+        local content="" line
+        while IFS= read -r line; do
+            [ "$line" = "END" ] && break
+            content+="$line"$'\n'
+        done
+        printf '%s' "$content"
+    }
+    echo -e "${CYAN}Dan noi dung Origin Certificate (PEM), ket thuc bang dong rieng chi co END:${NC}"
+    CERT_PEM=$(read_multiline_pem)
+    echo ""
+    echo -e "${CYAN}Dan noi dung Private Key (PEM), ket thuc bang dong rieng chi co END:${NC}"
+    KEY_PEM=$(read_multiline_pem)
+    echo ""
+
+    echo "$CERT_PEM" | grep -q "BEGIN CERTIFICATE" || error "Noi dung dan vao khong giong chung chi PEM hop le (thieu BEGIN CERTIFICATE)"
+    echo "$KEY_PEM" | grep -qE "BEGIN (RSA |EC )?PRIVATE KEY" || error "Noi dung dan vao khong giong private key PEM hop le (thieu BEGIN ... PRIVATE KEY)"
+fi
 
 # ── Nhập cấu hình GitHub cho /api/config (tùy chọn) ─────────
 echo -e "${CYAN}${BOLD}--- Dong bo file config tu GitHub (tuy chon) ---${NC}"
@@ -67,19 +123,6 @@ read -s GH_TOKEN
 echo ""
 echo ""
 
-# ── Nhập Cloudflare API Token (dùng cho xin SSL qua DNS-01) ─
-# DNS-01 challenge duoc dung thay vi HTTP-01 vi khong can port 80,
-# tranh xung dot voi cac service khac (vd psiphond) da chiem port 80/443.
-echo -e "${CYAN}${BOLD}--- Cloudflare API Token (de xin SSL, khong can port 80) ---${NC}"
-echo -e "${YELLOW}Tao tai: https://dash.cloudflare.com/profile/api-tokens${NC}"
-echo -e "${YELLOW}Dung template 'Edit zone DNS', gioi han vao đúng zone cua domain ban dung${NC}"
-echo ""
-printf "${CYAN}Cloudflare API Token${NC} (an khi go): "
-read -s CF_TOKEN
-echo ""
-[ -z "$CF_TOKEN" ] && error "Can Cloudflare API Token de xin SSL qua DNS-01 (khong the dung port 80/443)"
-echo ""
-
 # ── 1. Cài packages ─────────────────────────────────────────
 log "Cai dat dependencies..."
 apt update -qq
@@ -97,14 +140,18 @@ log "Dependencies da cai xong"
 #     du file .ini da dung dinh dang Token 100%.
 #   - Can cloudflare python module >= 2.3.1 de Token hoat dong; pip venv
 #     luon lay ban moi nhat nen tranh han loai loi nay.
-log "Cai certbot + Cloudflare plugin (pip venv, ho tro API Token)..."
-CERTBOT_VENV="/opt/certbot-venv"
-python3 -m venv "$CERTBOT_VENV"
-"$CERTBOT_VENV/bin/pip" install -q --upgrade pip
-"$CERTBOT_VENV/bin/pip" install -q certbot certbot-dns-cloudflare
-ln -sf "$CERTBOT_VENV/bin/certbot" /usr/local/bin/certbot
-hash -r
-log "Certbot (venv, ho tro Cloudflare API Token) da cai xong: $(certbot --version 2>/dev/null)"
+# Chi can khi dung phuong thuc 1 (Let's Encrypt DNS-01); phuong thuc 2
+# (tu dan chung chi) khong dung certbot nen bo qua buoc nay.
+if [ "$SSL_METHOD" = "1" ]; then
+    log "Cai certbot + Cloudflare plugin (pip venv, ho tro API Token)..."
+    CERTBOT_VENV="/opt/certbot-venv"
+    python3 -m venv "$CERTBOT_VENV"
+    "$CERTBOT_VENV/bin/pip" install -q --upgrade pip
+    "$CERTBOT_VENV/bin/pip" install -q certbot certbot-dns-cloudflare
+    ln -sf "$CERTBOT_VENV/bin/certbot" /usr/local/bin/certbot
+    hash -r
+    log "Certbot (venv, ho tro Cloudflare API Token) da cai xong: $(certbot --version 2>/dev/null)"
+fi
 
 # ── 2. Tạo thư mục ──────────────────────────────────────────
 mkdir -p "$INSTALL_DIR"
@@ -308,41 +355,82 @@ else
     log "Se dung port $SSL_PORT cho HTTPS thay vi 443"
 fi
 
-# ── 7b. Luu Cloudflare credentials cho certbot dns plugin ────
-mkdir -p /root/.secrets/certbot
-cat > /root/.secrets/certbot/cloudflare.ini << CFEOF
+# ── 7b/8a. Lay chung chi SSL theo phuong thuc da chon ────────
+if [ "$SSL_METHOD" = "1" ]; then
+    # Luu Cloudflare credentials cho certbot dns plugin
+    mkdir -p /root/.secrets/certbot
+    cat > /root/.secrets/certbot/cloudflare.ini << CFEOF
 dns_cloudflare_api_token = $CF_TOKEN
 CFEOF
-chmod 600 /root/.secrets/certbot/cloudflare.ini
+    chmod 600 /root/.secrets/certbot/cloudflare.ini
 
-# ── 8a. Xin chung chi SSL qua DNS-01 (khong can port 80/443) ─
-# Vi psiphond dang chiem dung ca port 80 va co the ca 443, HTTP-01
-# challenge (can port 80 mo) khong the dung duoc. DNS-01 challenge
-# xac thuc qua ban ghi TXT tren Cloudflare, hoan toan khong dung
-# den port 80/443 cua may chu, nen tranh duoc xung dot nay.
-log "Xin SSL certificate cho $DOMAIN (DNS-01 qua Cloudflare)..."
-if ! certbot certonly --dns-cloudflare \
-    --dns-cloudflare-credentials /root/.secrets/certbot/cloudflare.ini \
-    --dns-cloudflare-propagation-seconds 30 \
-    -d "$DOMAIN" --email "$EMAIL" --agree-tos --non-interactive > /tmp/certbot.log 2>&1; then
-    error "Cap SSL that bai. Chi tiet: cat /tmp/certbot.log (thuong do Cloudflare API Token sai quyen, hoac domain $DOMAIN khong nam trong zone Cloudflare cua token nay)"
+    # Xin chung chi SSL qua DNS-01 (khong can port 80/443). Vi psiphond
+    # dang chiem dung ca port 80 va co the ca 443, HTTP-01 challenge
+    # (can port 80 mo) khong the dung duoc. DNS-01 challenge xac thuc
+    # qua ban ghi TXT tren Cloudflare, hoan toan khong dung den port
+    # 80/443 cua may chu, nen tranh duoc xung dot nay.
+    log "Xin SSL certificate cho $DOMAIN (DNS-01 qua Cloudflare)..."
+    if ! certbot certonly --dns-cloudflare \
+        --dns-cloudflare-credentials /root/.secrets/certbot/cloudflare.ini \
+        --dns-cloudflare-propagation-seconds 30 \
+        -d "$DOMAIN" --email "$EMAIL" --agree-tos --non-interactive > /tmp/certbot.log 2>&1; then
+        error "Cap SSL that bai. Chi tiet: cat /tmp/certbot.log (thuong do Cloudflare API Token sai quyen, hoac domain $DOMAIN khong nam trong zone Cloudflare cua token nay)"
+    fi
+    log "SSL da cap xong"
+
+    CERT_PATH="/etc/letsencrypt/live/$DOMAIN/fullchain.pem"
+    KEY_PATH="/etc/letsencrypt/live/$DOMAIN/privkey.pem"
+else
+    # Luu chung chi + private key nguoi dung da dan (vd Cloudflare Origin CA)
+    log "Luu chung chi SSL da dan..."
+    mkdir -p /etc/ssl/mtunnel
+    printf '%s' "$CERT_PEM" > /etc/ssl/mtunnel/fullchain.pem
+    printf '%s' "$KEY_PEM"  > /etc/ssl/mtunnel/privkey.pem
+    chmod 644 /etc/ssl/mtunnel/fullchain.pem
+    chmod 600 /etc/ssl/mtunnel/privkey.pem
+
+    if ! openssl x509 -in /etc/ssl/mtunnel/fullchain.pem -noout > /tmp/cert-check.log 2>&1; then
+        error "Chung chi khong hop le. Chi tiet: cat /tmp/cert-check.log"
+    fi
+    if ! openssl pkey -in /etc/ssl/mtunnel/privkey.pem -noout > /tmp/key-check.log 2>&1; then
+        error "Private key khong hop le. Chi tiet: cat /tmp/key-check.log"
+    fi
+
+    CERT_PUBKEY_HASH=$(openssl x509 -in /etc/ssl/mtunnel/fullchain.pem -noout -pubkey 2>/dev/null | openssl pkey -pubin -outform DER 2>/dev/null | sha256sum)
+    KEY_PUBKEY_HASH=$(openssl pkey -in /etc/ssl/mtunnel/privkey.pem -pubout -outform DER 2>/dev/null | sha256sum)
+    if [ "$CERT_PUBKEY_HASH" != "$KEY_PUBKEY_HASH" ]; then
+        error "Chung chi va Private Key KHONG khop nhau (public key khac nhau) — kiem tra lai da dan dung cap chua"
+    fi
+
+    CERT_EXPIRY=$(openssl x509 -in /etc/ssl/mtunnel/fullchain.pem -noout -enddate | cut -d= -f2)
+    log "Chung chi hop le, khop voi private key. Het han: $CERT_EXPIRY"
+
+    CERT_PATH="/etc/ssl/mtunnel/fullchain.pem"
+    KEY_PATH="/etc/ssl/mtunnel/privkey.pem"
 fi
-log "SSL da cap xong"
 
 # ── 8b. Cau hinh Nginx — chi 1 server block HTTPS tren SSL_PORT ─
 # Khong tao block "listen 80" vi port 80 dang bi service khac (vd
 # psiphond) chiem, nginx se khong the bind duoc port do.
 log "Cau hinh Nginx..."
+if [ "$SSL_METHOD" = "1" ]; then
+    SSL_EXTRA_CONF="    include /etc/letsencrypt/options-ssl-nginx.conf;
+    ssl_dhparam /etc/letsencrypt/ssl-dhparams.pem;"
+else
+    SSL_EXTRA_CONF="    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_ciphers HIGH:!aNULL:!MD5;
+    ssl_prefer_server_ciphers on;"
+fi
+
 cat > /etc/nginx/sites-available/mtunnel << NGXEOF
 server {
     listen $SSL_PORT ssl;
     listen [::]:$SSL_PORT ssl;
     server_name $DOMAIN;
 
-    ssl_certificate     /etc/letsencrypt/live/$DOMAIN/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/$DOMAIN/privkey.pem;
-    include /etc/letsencrypt/options-ssl-nginx.conf;
-    ssl_dhparam /etc/letsencrypt/ssl-dhparams.pem;
+    ssl_certificate     $CERT_PATH;
+    ssl_certificate_key $KEY_PATH;
+$SSL_EXTRA_CONF
 
     location /api/events {
         proxy_pass            http://127.0.0.1:5000;
@@ -390,17 +478,20 @@ if ! systemctl is-active --quiet nginx; then
 fi
 log "Nginx da chay HTTPS tren port $SSL_PORT"
 
-# ── 8c. Auto-renew: certbot renew se tu dung lai dns-cloudflare
-#        plugin (da luu trong renewal config), khong can lam gi them
-#        ve phia cau hinh. Chi can dam bao nginx reload sau khi renew:
-if [ -f /etc/letsencrypt/renewal/$DOMAIN.conf ] && ! grep -q "renew_hook" /etc/letsencrypt/renewal/$DOMAIN.conf; then
-    echo "renew_hook = systemctl reload nginx" >> /etc/letsencrypt/renewal/$DOMAIN.conf
-fi
+# ── 8c. Auto-renew (chi ap dung cho phuong thuc 1 — Let's Encrypt):
+#        certbot renew se tu dung lai dns-cloudflare plugin (da luu
+#        trong renewal config). Chi can dam bao nginx reload sau renew.
+#        Phuong thuc 2 (tu dan chung chi) khong can renew tu dong —
+#        chung chi Origin CA thuong co han rat dai (vd 15 nam).
+if [ "$SSL_METHOD" = "1" ]; then
+    if [ -f /etc/letsencrypt/renewal/$DOMAIN.conf ] && ! grep -q "renew_hook" /etc/letsencrypt/renewal/$DOMAIN.conf; then
+        echo "renew_hook = systemctl reload nginx" >> /etc/letsencrypt/renewal/$DOMAIN.conf
+    fi
 
-# Vi certbot gio nam trong pip venv (khong phai apt), goi apt khong tu tao
-# san cron/systemd timer de renew nhu binh thuong -> tu tao timer rieng.
-log "Tao systemd timer tu-gia-han SSL..."
-cat > /etc/systemd/system/certbot-renew.service << RENEWSVCEOF
+    # Vi certbot gio nam trong pip venv (khong phai apt), goi apt khong tu
+    # tao san cron/systemd timer de renew nhu binh thuong -> tu tao rieng.
+    log "Tao systemd timer tu-gia-han SSL..."
+    cat > /etc/systemd/system/certbot-renew.service << RENEWSVCEOF
 [Unit]
 Description=Certbot renew (mtunnel, pip venv)
 
@@ -409,7 +500,7 @@ Type=oneshot
 ExecStart=$CERTBOT_VENV/bin/certbot renew --quiet
 RENEWSVCEOF
 
-cat > /etc/systemd/system/certbot-renew.timer << RENEWTIMEREOF
+    cat > /etc/systemd/system/certbot-renew.timer << RENEWTIMEREOF
 [Unit]
 Description=Chay certbot renew 2 lan/ngay (mtunnel)
 
@@ -422,9 +513,10 @@ Persistent=true
 WantedBy=timers.target
 RENEWTIMEREOF
 
-systemctl daemon-reload
-systemctl enable --now certbot-renew.timer
-log "Timer tu-gia-han da bat: systemctl list-timers certbot-renew.timer"
+    systemctl daemon-reload
+    systemctl enable --now certbot-renew.timer
+    log "Timer tu-gia-han da bat: systemctl list-timers certbot-renew.timer"
+fi
 
 # ── 9. Mở giao diện thiết lập token ────────────────────────
 echo ""
@@ -448,6 +540,14 @@ echo -e "${YELLOW}${BOLD}Nhung vao app Android (de verify chu ky /api/config):${
 echo -e "  SERVER_PUBLIC_KEY_B64 : ${BOLD}$SERVER_PUBLIC_KEY_B64${NC}"
 echo -e "  PINNED_PUBKEY_SHA256  : ${BOLD}$PINNED_PUBKEY_SHA256${NC}"
 echo ""
+if [ "$SSL_METHOD" = "2" ]; then
+    echo -e "${YELLOW}${BOLD}⚠️  Luu y ve chung chi tu dan (vd Cloudflare Origin CA):${NC}"
+    echo -e "  Chung chi nay KHONG duoc he thong/trinh duyet tin cay mac dinh."
+    echo -e "  App phai tu pin chung chi nay (hoac root CA cua no) trong"
+    echo -e "  network_security_config.xml, neu khong ket noi HTTPS se that bai."
+    echo -e "  Het han: ${BOLD}$CERT_EXPIRY${NC}"
+    echo ""
+fi
 echo -e "${CYAN}Lenh quan ly:${NC}"
 echo -e "  📋 Xem log    : journalctl -u mtunnel-license -f"
 echo -e "  🔑 Doi token  : mtunnel-token"
