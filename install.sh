@@ -245,11 +245,147 @@ pub_raw = key.public_key().public_bytes(
 )
 
 print(f"SERVER_PUBLIC_KEY_B64={base64.b64encode(pub_raw).decode()}")
-print(f"PINNED_PUBKEY_SHA256={hashlib.sha256(pub_raw).hexdigest()}")
 PYEOF
 chmod +x "$INSTALL_DIR/print_pubkey.py"
 ln -sf "$INSTALL_DIR/print_pubkey.py" /usr/local/bin/mtunnel-pubkey
 log "Script hien thi public key da tao — lenh: mtunnel-pubkey"
+
+# ── 6d. Tao script quan ly signing key (export/import giua cac VPS) ─
+log "Tao script quan ly signing key..."
+cat > "$INSTALL_DIR/manage_signing_key.sh" << 'SIGNKEYEOF'
+#!/bin/bash
+GREEN='\033[0;32m'
+CYAN='\033[0;36m'
+YELLOW='\033[1;33m'
+RED='\033[0;31m'
+BOLD='\033[1m'
+NC='\033[0m'
+
+INSTALL_DIR="/opt/mtunnel"
+SIGNING_KEY_FILE="$INSTALL_DIR/.signing_key"
+
+# In public key (base64) tương ứng với private key hiện có trong SIGNING_KEY_FILE
+print_public_key() {
+    python3 - << PYEOF
+import base64
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from cryptography.hazmat.primitives import serialization
+
+with open("$SIGNING_KEY_FILE", "rb") as f:
+    raw = f.read()
+key = Ed25519PrivateKey.from_private_bytes(raw)
+pub = key.public_key().public_bytes(
+    encoding=serialization.Encoding.Raw,
+    format=serialization.PublicFormat.Raw
+)
+print(base64.b64encode(pub).decode())
+PYEOF
+}
+
+clear
+echo ""
+echo -e "${GREEN}${BOLD}═══════════════════════════════════════════${NC}"
+echo -e "${GREEN}${BOLD}   MTunnel - Quan ly Signing Key (Ed25519)  ${NC}"
+echo -e "${GREEN}${BOLD}═══════════════════════════════════════════${NC}"
+echo ""
+
+if [ -f "$SIGNING_KEY_FILE" ] && [ -s "$SIGNING_KEY_FILE" ]; then
+    CURRENT_PUB=$(print_public_key 2>/dev/null)
+    echo -e "${YELLOW}Signing key hien tai:${NC}"
+    echo -e "  Public key: ${CYAN}$CURRENT_PUB${NC}"
+else
+    echo -e "${YELLOW}Chua co signing key nao (se tu sinh khi server chay lan dau).${NC}"
+fi
+echo ""
+
+echo -e "${CYAN}Chon thao tac:${NC}"
+echo "  1) Xem private key (dang base64) - de EXPORT sang VPS khac"
+echo "  2) Nhap private key (dang base64) - de IMPORT tu VPS khac"
+echo "  3) Thoat, khong doi gi"
+echo ""
+read -p "Nhap lua chon [1-3]: " CHOICE
+
+case "$CHOICE" in
+    1)
+        if [ ! -f "$SIGNING_KEY_FILE" ] || [ ! -s "$SIGNING_KEY_FILE" ]; then
+            echo -e "${RED}Chua co signing key nao de export. Khoi dong server 1 lan de no tu sinh key truoc.${NC}"
+            exit 1
+        fi
+        EXPORTED=$(base64 -w0 "$SIGNING_KEY_FILE")
+        echo ""
+        echo -e "${GREEN}${BOLD}Private key (base64) - GIU BI MAT, khong dang public o dau:${NC}"
+        echo -e "${CYAN}$EXPORTED${NC}"
+        echo ""
+        echo -e "${YELLOW}Cach dung: copy chuoi tren, chay 'mtunnel-signing-key' tren VPS khac,${NC}"
+        echo -e "${YELLOW}chon '2) Nhap private key', roi paste chuoi nay vao.${NC}"
+        ;;
+    2)
+        echo ""
+        echo -e "${YELLOW}Canh bao: thao tac nay se GHI DE signing key hien tai (neu co).${NC}"
+        echo -e "${YELLOW}App dang dung public key CU se KHONG con verify duoc chu ky server nay nua${NC}"
+        echo -e "${YELLOW}cho toi khi ban cap nhat lai public key moi trong app.${NC}"
+        echo ""
+        read -p "Paste private key (base64) can import: " IMPORT_B64
+
+        if [ -z "$IMPORT_B64" ]; then
+            echo -e "${RED}Khong duoc de trong!${NC}"
+            exit 1
+        fi
+
+        # Validate: phải decode được base64 và đúng 32 byte (Ed25519 raw private key)
+        VALID=$(python3 - << PYEOF
+import base64, sys
+try:
+    raw = base64.b64decode("$IMPORT_B64")
+    if len(raw) != 32:
+        print("invalid_length")
+    else:
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+        Ed25519PrivateKey.from_private_bytes(raw)  # thử load, lỗi thì raise exception
+        print("ok")
+except Exception as e:
+    print("invalid:" + str(e))
+PYEOF
+)
+        if [ "$VALID" != "ok" ]; then
+            echo -e "${RED}Key khong hop le: $VALID${NC}"
+            echo -e "${RED}Phai la key export tu 'mtunnel-signing-key' (option 1) tren VPS khac.${NC}"
+            exit 1
+        fi
+
+        python3 -c "
+import base64
+raw = base64.b64decode('$IMPORT_B64')
+with open('$SIGNING_KEY_FILE', 'wb') as f:
+    f.write(raw)
+"
+        chmod 600 "$SIGNING_KEY_FILE"
+        chown www-data:www-data "$SIGNING_KEY_FILE" 2>/dev/null || true
+        systemctl restart mtunnel-license 2>/dev/null || true
+
+        NEW_PUB=$(print_public_key 2>/dev/null)
+        echo ""
+        echo -e "${GREEN}${BOLD}✅ Signing key da import thanh cong!${NC}"
+        echo -e "   Public key: ${CYAN}$NEW_PUB${NC}"
+        echo ""
+        echo -e "${YELLOW}Public key nay phai KHOP voi public key da khai bao trong app${NC}"
+        echo -e "${YELLOW}(ConfigClientNative.java -> SERVER_PUBLIC_KEYS_B64) cho server nay.${NC}"
+        ;;
+    3)
+        echo "Thoat, khong doi gi."
+        exit 0
+        ;;
+    *)
+        echo -e "${RED}Lua chon khong hop le.${NC}"
+        exit 1
+        ;;
+esac
+echo ""
+
+SIGNKEYEOF
+chmod +x "$INSTALL_DIR/manage_signing_key.sh"
+ln -sf "$INSTALL_DIR/manage_signing_key.sh" /usr/local/bin/mtunnel-signing-key
+log "Script quan ly signing key da tao — lenh: mtunnel-signing-key"
 
 # ── 6c. Doi signing key duoc tao (server tao luc khoi dong) ─
 log "Doi service tao signing key..."
@@ -261,11 +397,9 @@ done
 if [ -f "$INSTALL_DIR/.signing_key" ]; then
     PUBKEY_OUT=$(python3 "$INSTALL_DIR/print_pubkey.py" 2>/dev/null || true)
     SERVER_PUBLIC_KEY_B64=$(echo "$PUBKEY_OUT" | grep '^SERVER_PUBLIC_KEY_B64=' | cut -d= -f2-)
-    PINNED_PUBKEY_SHA256=$(echo "$PUBKEY_OUT" | grep '^PINNED_PUBKEY_SHA256=' | cut -d= -f2-)
 else
     warn "Khong thay signing key sau 10s — kiem tra: journalctl -u mtunnel-license -e"
     SERVER_PUBLIC_KEY_B64="(chua co - chay 'mtunnel-pubkey' sau)"
-    PINNED_PUBKEY_SHA256="(chua co - chay 'mtunnel-pubkey' sau)"
 fi
 
 # ── 7a. Do cong SSL (port 80/443 co the da bi service khac nhu ────
@@ -302,9 +436,15 @@ chmod 600 /root/.secrets/certbot/cloudflare.ini
 # xac thuc qua ban ghi TXT tren Cloudflare, hoan toan khong dung
 # den port 80/443 cua may chu, nen tranh duoc xung dot nay.
 log "Xin SSL certificate cho $DOMAIN (DNS-01 qua Cloudflare)..."
+# --reuse-key: QUAN TRONG cho TLS pinning — neu khong co flag nay, moi lan
+# certbot renew (tu dong, ~60-90 ngay/lan) se tao private key MOI, khien
+# TLS pin (CURLOPT_PINNEDPUBLICKEY trong app) doi theo va app se bi tu choi
+# ket noi cho toi khi ai do nhan ra va cap nhat lai pin. Giu --reuse-key de
+# key (va pin) on dinh xuyen suot vong doi domain.
 if ! certbot certonly --dns-cloudflare \
     --dns-cloudflare-credentials /root/.secrets/certbot/cloudflare.ini \
     --dns-cloudflare-propagation-seconds 30 \
+    --reuse-key \
     -d "$DOMAIN" --email "$EMAIL" --agree-tos --non-interactive > /tmp/certbot.log 2>&1; then
     error "Cap SSL that bai. Chi tiet: cat /tmp/certbot.log (thuong do Cloudflare API Token sai quyen, hoac domain $DOMAIN khong nam trong zone Cloudflare cua token nay)"
 fi
@@ -370,6 +510,40 @@ if ! systemctl is-active --quiet nginx; then
     error "Nginx khong khoi dong duoc. Kiem tra: journalctl -xeu nginx --no-pager | tail -30"
 fi
 log "Nginx da chay HTTPS tren port $SSL_PORT"
+
+# ── 8d. Tinh TLS pin THAT tu chung chi dang chay (khong phai tu Ed25519 key) ─
+# Day la pin cho CURLOPT_PINNEDPUBLICKEY (libcurl, tang TLS) — khac hoan toan
+# voi SERVER_PUBLIC_KEY_B64 (Ed25519, tang ung dung, dung de verify chu ky
+# noi dung config). Phai do sau khi nginx da that su phuc vu HTTPS, luc nay
+# moi co cert that de tinh — khong the tinh truoc do nhu ban cu.
+log "Tinh TLS pin tu chung chi dang chay..."
+PINNED_PUBKEY_SHA256=$(echo | openssl s_client -connect "127.0.0.1:$SSL_PORT" -servername "$DOMAIN" 2>/dev/null \
+    | openssl x509 -pubkey -noout 2>/dev/null \
+    | openssl pkey -pubin -outform der 2>/dev/null \
+    | openssl dgst -sha256 -binary \
+    | base64)
+
+if [ -z "$PINNED_PUBKEY_SHA256" ]; then
+    warn "Khong tinh duoc TLS pin tu dong — chay tay sau: mtunnel-tlspin"
+    PINNED_PUBKEY_SHA256="(chua co - chay 'mtunnel-tlspin' sau)"
+else
+    PINNED_PUBKEY_SHA256="sha256//$PINNED_PUBKEY_SHA256"
+    log "TLS pin: $PINNED_PUBKEY_SHA256"
+fi
+
+# Luu lai script de tinh lai pin bat cu luc nao (vd sau khi Let's Encrypt renew
+# cert va doi sang key khac — pin se doi theo, can cap nhat lai trong app)
+cat > "$INSTALL_DIR/print_tlspin.sh" << TLSPINEOF
+#!/bin/bash
+echo | openssl s_client -connect "127.0.0.1:$SSL_PORT" -servername "$DOMAIN" 2>/dev/null \\
+    | openssl x509 -pubkey -noout 2>/dev/null \\
+    | openssl pkey -pubin -outform der 2>/dev/null \\
+    | openssl dgst -sha256 -binary \\
+    | base64 | sed 's/^/sha256\\/\\//'
+TLSPINEOF
+chmod +x "$INSTALL_DIR/print_tlspin.sh"
+ln -sf "$INSTALL_DIR/print_tlspin.sh" /usr/local/bin/mtunnel-tlspin
+log "Script tinh TLS pin da tao — lenh: mtunnel-tlspin (chay lai sau moi lan renew SSL)"
 
 # ── 8c. Auto-renew: certbot renew se tu dung lai dns-cloudflare
 #        plugin (da luu trong renewal config), khong can lam gi them.
