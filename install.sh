@@ -109,6 +109,20 @@ if [ "$SSL_METHOD" = "1" ]; then
     read -s CF_TOKEN
     echo ""
     [ -z "$CF_TOKEN" ] && error "Can Cloudflare API Token de xin SSL qua DNS-01 (khong the dung port 80/443)"
+
+    # Chan som token dang "cfat_..." (Account API Token — tao o muc
+    # "Manage Account > Account API Tokens"). Loai token nay CHUA tuong
+    # thich voi thu vien cloudflare-python ma certbot-dns-cloudflare dung,
+    # se luon bao "Authentication error 10000" du quyen/zone cau hinh dung.
+    # Certbot can "User API Token" tao o "My Profile > API Tokens".
+    case "$CF_TOKEN" in
+        cfat_*)
+            error "Token nay la 'Account API Token' (tien to cfat_) — KHONG tuong thich voi certbot.
+Vao https://dash.cloudflare.com/profile/api-tokens (muc 'Ma thong bao API nguoi dung',
+KHONG phai 'Manage Account > Account API Tokens') de tao User API Token voi quyen
+Zone:DNS:Edit + Zone:Zone:Read, gioi han vao dung zone cua domain, roi chay lai script."
+            ;;
+    esac
     echo ""
 else
     echo -e "${CYAN}${BOLD}--- Chung chi SSL co san (vd: Cloudflare Origin CA) ---${NC}"
@@ -183,6 +197,15 @@ apt update -qq
 apt install -y python3-pip python3-venv nginx curl > /dev/null 2>&1
 pip3 install flask gunicorn gevent cryptography -q
 log "Dependencies da cai xong"
+
+# Mot so VPS (container/image toi gian) khong tao san /var/log/nginx du
+# da apt install nginx — nginx se bao loi "could not open error log file"
+# ngay ca khi config dung 100%. Tao lai cho chac, khong anh huong gi neu
+# thu muc da ton tai.
+mkdir -p /var/log/nginx
+touch /var/log/nginx/error.log /var/log/nginx/access.log
+chown -R www-data:adm /var/log/nginx
+log "Da dam bao thu muc log nginx ton tai"
 
 # ── 1b. Cai certbot + plugin Cloudflare qua pip venv rieng ──
 # KHONG dung apt (certbot / python3-certbot-dns-cloudflare) vi ban apt cua
@@ -703,6 +726,33 @@ rm -f /etc/nginx/sites-enabled/default
 if command -v ufw > /dev/null 2>&1 && ufw status | grep -q "Status: active"; then
     ufw allow "$SSL_PORT"/tcp > /dev/null 2>&1
     log "Da mo port $SSL_PORT tren ufw"
+fi
+
+# Certbot cai qua pip venv o buoc 1b CHI co plugin certbot-dns-cloudflare,
+# KHONG co plugin certbot-nginx (--nginx). Nen certbot khong tu sinh ra
+# /etc/letsencrypt/options-ssl-nginx.conf va ssl-dhparams.pem nhu khi cai
+# qua apt/snap ban dan co plugin nginx di kem. Config nginx o tren lai
+# "include" 2 file nay khi SSL_METHOD=1 -> tu tao neu chua co, tranh loi
+# "failed (2: No such file or directory)" luc nginx -t.
+if [ "$SSL_METHOD" = "1" ]; then
+    if [ ! -f /etc/letsencrypt/options-ssl-nginx.conf ]; then
+        log "Tao /etc/letsencrypt/options-ssl-nginx.conf (certbot venv khong tu sinh vi thieu plugin nginx)..."
+        mkdir -p /etc/letsencrypt
+        cat > /etc/letsencrypt/options-ssl-nginx.conf << 'SSLOPTEOF'
+ssl_session_cache shared:le_nginx_SSL:10m;
+ssl_session_timeout 1440m;
+ssl_session_tickets off;
+
+ssl_protocols TLSv1.2 TLSv1.3;
+ssl_prefer_server_ciphers off;
+
+ssl_ciphers "ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:DHE-RSA-AES128-GCM-SHA256:DHE-RSA-AES256-GCM-SHA384";
+SSLOPTEOF
+    fi
+    if [ ! -f /etc/letsencrypt/ssl-dhparams.pem ]; then
+        log "Tao /etc/letsencrypt/ssl-dhparams.pem (co the mat 1-3 phut)..."
+        openssl dhparam -out /etc/letsencrypt/ssl-dhparams.pem 2048 > /dev/null 2>&1
+    fi
 fi
 
 if ! nginx -t > /tmp/nginx-test.log 2>&1; then
