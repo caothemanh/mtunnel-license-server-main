@@ -1,20 +1,42 @@
 #!/usr/bin/env python3
 from flask import Flask, request, jsonify, Response, stream_with_context
-import logging, os, time, json, queue, threading, base64, hmac, urllib.request, urllib.error
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
+import logging, os, time, json, queue, threading, base64, hmac, secrets, urllib.request, urllib.error
 
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from cryptography.hazmat.primitives import serialization
 
 app = Flask(__name__)
+
+# Rate-limit theo IP — chặn scrape hàng loạt (script tự động gọi /api/config
+# hoặc /api/verify liên tục), không phải để chặn user thường (user thường
+# chỉ gọi vài lần/ngày lúc mở app, không bao giờ chạm ngưỡng này).
+limiter = Limiter(
+    get_remote_address,
+    app=app,
+    storage_uri="memory://",   # đủ dùng cho 1 tiến trình gunicorn -w 1;
+                               # nếu tăng lên nhiều worker, đổi sang Redis
+                               # (storage_uri="redis://127.0.0.1:6379") để
+                               # đếm chung giữa các worker thay vì mỗi worker
+                               # đếm riêng (sẽ làm giới hạn thực tế cao hơn
+                               # dự kiến theo đúng số worker).
+    default_limits=[]         # không áp mặc định lên MỌI route (vd /health
+                               # cần gọi thoải mái để healthcheck) — chỉ áp
+                               # riêng lên từng route nhạy cảm bên dưới.
+)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
 INSTALL_DIR       = "/opt/mtunnel"
-TOKEN_FILE        = os.path.join(INSTALL_DIR, ".token")
+TOKEN_FILE        = os.path.join(INSTALL_DIR, ".token")          # token admin cũ (giữ lại, xem ghi chú dưới)
+TOKENS_DIR        = os.path.join(INSTALL_DIR, ".tokens")         # MỚI: mỗi file = 1 token đã cấp cho 1 lượt cài app
 CONFIG_FILE       = os.path.join(INSTALL_DIR, ".config")
 CONFIG_DATA_FILE  = os.path.join(INSTALL_DIR, ".config_data.json")
 SIGNING_KEY_FILE  = os.path.join(INSTALL_DIR, ".signing_key")
 GITHUB_TOKEN_FILE = os.path.join(INSTALL_DIR, ".github_token")
 GITHUB_REPO_FILE  = os.path.join(INSTALL_DIR, ".github_repo")
+
+os.makedirs(TOKENS_DIR, exist_ok=True)
 
 CACHE_TTL        = 3600
 GITHUB_FETCH_TTL = 60
@@ -79,15 +101,47 @@ def _get_package():
         return ""
 
 def _check_auth(token, pkg):
-    valid_token = _read_token()
+    """
+    Kiểm tra package name — vẫn giữ, chặn app khác package gọi vào.
+    KHÔNG còn kiểm tra token ở đây nữa — token giờ xử lý riêng bằng
+    _is_valid_token()/_issue_new_token() bên dưới, vì cần phân biệt
+    "token hợp lệ" (đã cấp trước) và "chưa có token, cần cấp mới"
+    (khác với trước đây: không có token = luôn từ chối).
+    """
     valid_package = _get_package()
-    if not valid_token:
+    if not valid_package:
         return False, "server_not_configured"
     if pkg != valid_package:
         return False, "wrong_package"
-    if not hmac.compare_digest(token, valid_token):
-        return False, "invalid_token"
     return True, None
+
+def _is_valid_token(token):
+    """Token hợp lệ = có file tương ứng trong TOKENS_DIR (chưa bị revoke)."""
+    if not token:
+        return False
+    # Chặn path traversal — token chỉ được chứa ký tự an toàn cho tên file
+    if "/" in token or ".." in token or len(token) > 128:
+        return False
+    token_file = os.path.join(TOKENS_DIR, token)
+    return os.path.isfile(token_file)
+
+def _issue_new_token():
+    """Sinh 1 token ngẫu nhiên thật (không tính từ APK/chữ ký gì cả),
+    lưu lại để lần sau app dùng lại đúng token này."""
+    new_token = secrets.token_urlsafe(32)   # ~256 bit entropy, không đoán được
+    token_file = os.path.join(TOKENS_DIR, new_token)
+    with open(token_file, "w") as f:
+        f.write(str(int(time.time())))   # lưu thời điểm cấp, tiện audit/dọn dẹp sau này
+    return new_token
+
+def _revoke_token(token):
+    """Xóa 1 token cụ thể — chỉ thiết bị/lượt cài đó bị ảnh hưởng,
+    không như trước đây (đổi 1 token chung = revoke TOÀN BỘ app)."""
+    token_file = os.path.join(TOKENS_DIR, token)
+    if os.path.isfile(token_file):
+        os.remove(token_file)
+        return True
+    return False
 
 def _get_github_settings():
     settings = {}
@@ -208,6 +262,7 @@ _watcher = threading.Thread(target=_watch_token, daemon=True, name="token-watche
 _watcher.start()
 
 @app.route("/api/verify", methods=["POST"])
+@limiter.limit("30 per minute")   # user thật chỉ gọi lúc mở app, không bao giờ gần ngưỡng này
 def verify():
     data  = request.get_json(force=True, silent=True) or {}
     token = data.get("token", "")
@@ -216,17 +271,26 @@ def verify():
 
     app.logger.info(f"[verify] {ip} | pkg={pkg} | token={token[:8]}...")
 
-    ok, reason = _check_auth(token, pkg)
+    ok, reason = _check_auth(token, pkg)   # chỉ check package, không check token nữa
     if not ok:
         app.logger.warning(f"[verify] FAILED from {ip}: {reason}")
         return jsonify({"valid": False, "reason": reason})
 
+    issued_new_token = None
+    if not _is_valid_token(token):
+        issued_new_token = _issue_new_token()
+        app.logger.info(f"[verify] Cap token moi cho {ip}: {issued_new_token[:8]}...")
+
     expire_at = int(time.time()) + CACHE_TTL
     app.logger.info(f"[verify] PASS | expire_at={expire_at}")
-    return jsonify({"valid": True, "expire_at": expire_at})
+    response = {"valid": True, "expire_at": expire_at}
+    if issued_new_token:
+        response["new_token"] = issued_new_token   # app PHẢI lưu lại giá trị này, dùng cho các lần gọi sau
+    return jsonify(response)
 
 
 @app.route("/api/config", methods=["POST"])
+@limiter.limit("10 per minute")   # chặt hơn /api/verify vì đây là nơi lộ Servers array
 def get_config():
     data  = request.get_json(force=True, silent=True) or {}
     token = data.get("token", "")
@@ -235,10 +299,18 @@ def get_config():
 
     app.logger.info(f"[config] {ip} | pkg={pkg} | token={token[:8]}...")
 
-    ok, reason = _check_auth(token, pkg)
+    ok, reason = _check_auth(token, pkg)   # chỉ check package, không check token nữa
     if not ok:
         app.logger.warning(f"[config] DENIED from {ip}: {reason}")
         return jsonify({"error": reason}), 403
+
+    issued_new_token = None
+    if not _is_valid_token(token):
+        # Lần đầu (chưa có token) HOẶC token cũ đã bị revoke — cấp token mới,
+        # KHÔNG từ chối request — vẫn trả config luôn trong CÙNG 1 lần gọi,
+        # tránh app phải gọi thêm 1 round-trip riêng chỉ để "đăng ký".
+        issued_new_token = _issue_new_token()
+        app.logger.info(f"[config] Cap token moi cho {ip}: {issued_new_token[:8]}...")
 
     config_bytes = _get_config_bytes()
     if config_bytes is None:
@@ -248,10 +320,13 @@ def get_config():
     signature = SIGNING_KEY.sign(config_bytes)
 
     app.logger.info(f"[config] served to {ip} | size={len(config_bytes)} bytes")
-    return jsonify({
+    response = {
         "data": base64.b64encode(config_bytes).decode(),
         "signature": base64.b64encode(signature).decode()
-    })
+    }
+    if issued_new_token:
+        response["new_token"] = issued_new_token   # app PHẢI lưu lại giá trị này (Keystore), dùng cho lần gọi sau
+    return jsonify(response)
 
 
 @app.route("/api/events", methods=["GET"])
@@ -295,14 +370,17 @@ def events():
 
 @app.route("/health", methods=["GET"])
 def health():
-    token_set  = os.path.exists(TOKEN_FILE) and _read_token() != ""
+    try:
+        issued_tokens_count = len(os.listdir(TOKENS_DIR))
+    except:
+        issued_tokens_count = 0
     gh_set     = os.path.exists(GITHUB_TOKEN_FILE) and os.path.exists(GITHUB_REPO_FILE)
     config_set = os.path.exists(CONFIG_DATA_FILE)
     with _sse_lock:
         connected = len(_sse_clients)
     return jsonify({
         "status": "ok",
-        "token_configured": token_set,
+        "issued_tokens_count": issued_tokens_count,
         "github_configured": gh_set,
         "config_cache_exists": config_set,
         "package": _get_package(),
