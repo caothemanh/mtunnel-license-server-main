@@ -34,10 +34,17 @@ CONFIG_DATA_FILE  = os.path.join(INSTALL_DIR, ".config_data.json")
 SIGNING_KEY_FILE  = os.path.join(INSTALL_DIR, ".signing_key")
 GITHUB_TOKEN_FILE = os.path.join(INSTALL_DIR, ".github_token")
 GITHUB_REPO_FILE  = os.path.join(INSTALL_DIR, ".github_repo")
+DEX_HASHES_FILE   = os.path.join(INSTALL_DIR, ".dex_hashes.json")
 
 
 CACHE_TTL        = 3600
 GITHUB_FETCH_TTL = 60
+DEX_NONCE_TTL    = 60   # nonce phải được dùng trong 60s, dùng 1 lần rồi bỏ
+
+# nonce đang "sống" (đã phát cho app, chưa được app dùng để verify)
+# -> chống replay: 1 nonce chỉ đổi lấy được 1 câu trả lời đã ký duy nhất.
+_dex_nonces = {}
+_dex_nonce_lock = threading.Lock()
 
 _github_cache = {"bytes": None, "fetched_at": 0}
 
@@ -255,6 +262,93 @@ def verify():
     expire_at = int(time.time()) + CACHE_TTL
     app.logger.info(f"[verify] PASS | expire_at={expire_at}")
     return jsonify({"valid": True, "expire_at": expire_at})
+
+
+def _load_dex_hashes():
+    """
+    File .dex_hashes.json chứa danh sách các combined-hash HỢP LỆ hiện tại,
+    ví dụ khi đang rollout bản mới thì để cả hash bản cũ + bản mới cùng lúc:
+      {"allowed": ["<sha256 hex bản 1.0.3>", "<sha256 hex bản 1.0.4>"]}
+    Combined-hash = sha256(nối các sha256 của từng classes*.dex, đã sort tên file),
+    tính bằng script build-time (xem compute_dex_hash.py), KHÔNG tính trên server.
+    """
+    try:
+        with open(DEX_HASHES_FILE, "r") as f:
+            return json.load(f).get("allowed", [])
+    except:
+        return []
+
+def _dex_nonce_cleanup():
+    now = time.time()
+    with _dex_nonce_lock:
+        for n in [n for n, exp in _dex_nonces.items() if exp < now]:
+            del _dex_nonces[n]
+
+@app.route("/api/dex-challenge", methods=["POST"])
+@limiter.limit("30 per minute")
+def dex_challenge():
+    data  = request.get_json(force=True, silent=True) or {}
+    token = data.get("token", "")
+    pkg   = data.get("pkg",   "")
+    ip    = request.remote_addr
+
+    ok, reason = _check_auth(token, pkg)
+    if not ok:
+        app.logger.warning(f"[dex-challenge] DENIED {ip}: {reason}")
+        return jsonify({"error": reason}), 403
+
+    _dex_nonce_cleanup()
+    nonce = base64.urlsafe_b64encode(os.urandom(24)).decode()
+    with _dex_nonce_lock:
+        _dex_nonces[nonce] = time.time() + DEX_NONCE_TTL
+
+    return jsonify({"nonce": nonce, "expires_in": DEX_NONCE_TTL})
+
+
+@app.route("/api/dex-verify", methods=["POST"])
+@limiter.limit("30 per minute")
+def dex_verify():
+    data     = request.get_json(force=True, silent=True) or {}
+    token    = data.get("token", "")
+    pkg      = data.get("pkg",   "")
+    nonce    = data.get("nonce", "")
+    dex_hash = data.get("dex_hash", "")
+    ip       = request.remote_addr
+
+    ok, reason = _check_auth(token, pkg)
+    if not ok:
+        app.logger.warning(f"[dex-verify] AUTH FAILED {ip}: {reason}")
+        return jsonify({"valid": False, "reason": reason})
+
+    # Nonce phải tồn tại + chưa hết hạn + CHỈ dùng được đúng 1 lần (pop luôn)
+    with _dex_nonce_lock:
+        expire_at = _dex_nonces.pop(nonce, None)
+    if expire_at is None or expire_at < time.time():
+        app.logger.warning(f"[dex-verify] REJECT {ip}: bad_or_reused_or_expired_nonce")
+        return jsonify({"valid": False, "reason": "bad_or_expired_nonce"})
+
+    allowed  = _load_dex_hashes()
+    is_valid = any(hmac.compare_digest(dex_hash, h) for h in allowed) if dex_hash else False
+
+    # Ký kết quả (không chỉ trả true/false thô) — app verify chữ ký bằng
+    # đúng public key Ed25519 đã pin sẵn (giống luồng /api/config), nên
+    # kẻ tấn công có full quyền trên máy (root) chặn được response ở tầng
+    # transport vẫn KHÔNG tự chế được response "valid=true" hợp lệ nếu
+    # không có private key trên server. nonce được nhúng lại vào payload
+    # để app đối chiếu đúng câu hỏi nó vừa hỏi, chặn replay 1 response cũ.
+    result_payload = {"valid": is_valid, "nonce": nonce, "ts": int(time.time())}
+    message = json.dumps(result_payload, sort_keys=True, separators=(",", ":")).encode()
+    signature = SIGNING_KEY.sign(message)
+
+    if is_valid:
+        app.logger.info(f"[dex-verify] OK {ip} | pkg={pkg}")
+    else:
+        app.logger.warning(f"[dex-verify] MISMATCH {ip} | pkg={pkg} | got={dex_hash[:16] if dex_hash else '(empty)'}...")
+
+    return jsonify({
+        "result": base64.b64encode(message).decode(),
+        "signature": base64.b64encode(signature).decode()
+    })
 
 
 @app.route("/api/config", methods=["POST"])

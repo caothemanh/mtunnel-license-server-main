@@ -286,6 +286,10 @@ INSTALL_DIR="/opt/mtunnel"
 TOKEN_FILE="$INSTALL_DIR/.token"
 CONFIG_FILE="$INSTALL_DIR/.config"
 SIGNING_KEY_FILE="$INSTALL_DIR/.signing_key"
+DEX_HASHES_FILE="$INSTALL_DIR/.dex_hashes.json"
+APK_UPLOAD_DIR="$INSTALL_DIR/apk_uploads"
+mkdir -p "$APK_UPLOAD_DIR"
+chown www-data:www-data "$APK_UPLOAD_DIR" 2>/dev/null || true
 
 PACKAGE=""; DOMAIN=""; SSL_PORT=""
 if [ -f "$CONFIG_FILE" ]; then
@@ -336,6 +340,196 @@ show_header() {
         echo -e "  Token   : ${YELLOW}(chua thiet lap)${NC}"
     fi
     echo ""
+}
+
+compute_dex_hash() {
+    local apk_path="$1"
+    python3 - "$apk_path" << 'PYEOF'
+import sys, zipfile, hashlib, re
+apk_path = sys.argv[1]
+DEX_RE = re.compile(r"^classes\d*\.dex$")
+try:
+    with zipfile.ZipFile(apk_path, "r") as z:
+        entries = sorted(n for n in z.namelist() if DEX_RE.match(n))
+        if not entries:
+            print("ERROR:no_dex_entries_found", file=sys.stderr)
+            sys.exit(1)
+        digests = b""
+        for name in entries:
+            data = z.read(name)
+            h = hashlib.sha256(data).digest()
+            digests += h
+            print(f"  {name}: {h.hex()} ({len(data)} bytes)", file=sys.stderr)
+        print(hashlib.sha256(digests).hexdigest())
+except Exception as e:
+    print(f"ERROR:{e}", file=sys.stderr)
+    sys.exit(1)
+PYEOF
+}
+
+pick_apk_file() {
+    SELECTED_APK=""
+    mapfile -t APK_FILES < <(find "$APK_UPLOAD_DIR" -maxdepth 1 -type f -iname "*.apk" 2>/dev/null | sort)
+    if [ ${#APK_FILES[@]} -eq 0 ]; then
+        echo -e "${RED}Khong tim thay file .apk nao trong $APK_UPLOAD_DIR${NC}"
+        echo -e "${YELLOW}Upload truoc bang lenh (chay tu may build, KHONG phai tren VPS):${NC}"
+        echo -e "  ${CYAN}scp app-release.apk root@<domain-hoac-ip>:$APK_UPLOAD_DIR/${NC}"
+        return 1
+    fi
+    echo -e "${CYAN}${BOLD}Cac file APK tim thay trong $APK_UPLOAD_DIR:${NC}"
+    echo ""
+    local i=1
+    for f in "${APK_FILES[@]}"; do
+        local size mtime
+        size=$(du -h "$f" 2>/dev/null | cut -f1)
+        mtime=$(date -r "$f" "+%Y-%m-%d %H:%M" 2>/dev/null)
+        echo -e "  ${BOLD}$i)${NC} $(basename "$f")  ${YELLOW}(${size}, sua luc ${mtime})${NC}"
+        i=$((i + 1))
+    done
+    echo ""
+    read -p "Chon so [1-${#APK_FILES[@]}] (Enter de huy): " PICK
+    if [ -z "$PICK" ]; then return 1; fi
+    if ! [[ "$PICK" =~ ^[0-9]+$ ]] || [ "$PICK" -lt 1 ] || [ "$PICK" -gt ${#APK_FILES[@]} ]; then
+        echo -e "${RED}Lua chon khong hop le.${NC}"
+        return 1
+    fi
+    SELECTED_APK="${APK_FILES[$((PICK - 1))]}"
+    return 0
+}
+
+list_dex_hashes() {
+    python3 - "$DEX_HASHES_FILE" << 'PYEOF'
+import sys, json
+try:
+    with open(sys.argv[1]) as f:
+        allowed = json.load(f).get("allowed", [])
+except Exception:
+    allowed = []
+if not allowed:
+    print("(chua co hash nao trong allow-list)")
+else:
+    for i, h in enumerate(allowed, 1):
+        print(f"  {i}) {h}")
+PYEOF
+}
+
+add_dex_hash() {
+    local hash_hex="$1"
+    python3 - "$DEX_HASHES_FILE" "$hash_hex" << 'PYEOF'
+import sys, json, os
+path, new_hash = sys.argv[1], sys.argv[2]
+try:
+    with open(path) as f:
+        doc = json.load(f)
+except Exception:
+    doc = {"allowed": []}
+allowed = doc.setdefault("allowed", [])
+if new_hash in allowed:
+    print("DUPLICATE")
+else:
+    allowed.append(new_hash)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(doc, f, indent=2)
+    os.replace(tmp, path)
+    print("ADDED")
+PYEOF
+}
+
+remove_dex_hash_by_index() {
+    local idx="$1"
+    python3 - "$DEX_HASHES_FILE" "$idx" << 'PYEOF'
+import sys, json, os
+path, idx = sys.argv[1], int(sys.argv[2])
+try:
+    with open(path) as f:
+        doc = json.load(f)
+except Exception:
+    print("ERROR:file_not_found")
+    sys.exit(1)
+allowed = doc.get("allowed", [])
+if idx < 1 or idx > len(allowed):
+    print("ERROR:invalid_index")
+    sys.exit(1)
+removed = allowed.pop(idx - 1)
+tmp = path + ".tmp"
+with open(tmp, "w") as f:
+    json.dump(doc, f, indent=2)
+os.replace(tmp, path)
+print(f"REMOVED:{removed}")
+PYEOF
+}
+
+dex_hash_menu() {
+    while true; do
+        echo -e "${CYAN}${BOLD}--- Quan ly DEX Hash Allow-list (/api/dex-verify) ---${NC}"
+        echo ""
+        echo "  1) Them hash tu file APK (chon theo so, khong go duong dan)"
+        echo "  2) Xem danh sach hash dang duoc phep"
+        echo "  3) Xoa 1 hash khoi allow-list"
+        echo "  4) Quay lai"
+        echo ""
+        read -p "Chon [1-4]: " DH_CHOICE
+        echo ""
+        case "$DH_CHOICE" in
+            1)
+                if ! pick_apk_file; then
+                    :
+                else
+                    echo ""
+                    echo -e "${YELLOW}Dang tinh hash cho: $(basename "$SELECTED_APK")...${NC}"
+                    echo ""
+                    OUTPUT=$(compute_dex_hash "$SELECTED_APK")
+                    COMBINED=$(echo "$OUTPUT" | tail -1)
+                    if [[ "$COMBINED" == ERROR:* ]]; then
+                        echo -e "${RED}That bai: $COMBINED${NC}"
+                    else
+                        echo -e "${GREEN}Combined SHA-256: ${BOLD}$COMBINED${NC}"
+                        echo ""
+                        read -p "Them hash nay vao allow-list? [y/N]: " DH_CONFIRM
+                        if [[ "$DH_CONFIRM" == "y" || "$DH_CONFIRM" == "Y" ]]; then
+                            DH_RESULT=$(add_dex_hash "$COMBINED")
+                            chmod 600 "$DEX_HASHES_FILE" 2>/dev/null || true
+                            chown www-data:www-data "$DEX_HASHES_FILE" 2>/dev/null || true
+                            if [ "$DH_RESULT" == "ADDED" ]; then
+                                echo -e "${GREEN}✅ Da them vao allow-list (khong can restart service).${NC}"
+                            else
+                                echo -e "${YELLOW}Hash nay da co san trong allow-list roi.${NC}"
+                            fi
+                        else
+                            echo -e "${YELLOW}Da huy.${NC}"
+                        fi
+                    fi
+                fi
+                ;;
+            2)
+                list_dex_hashes
+                ;;
+            3)
+                list_dex_hashes
+                echo ""
+                read -p "Nhap so thu tu muon xoa (Enter de huy): " DH_IDX
+                if [ -n "$DH_IDX" ] && [[ "$DH_IDX" =~ ^[0-9]+$ ]]; then
+                    DH_RESULT=$(remove_dex_hash_by_index "$DH_IDX")
+                    if [[ "$DH_RESULT" == REMOVED:* ]]; then
+                        echo -e "${GREEN}✅ Da xoa: ${DH_RESULT#REMOVED:}${NC}"
+                        echo -e "${RED}App nao dang chay dung hash nay se bi kill trong lan check ke tiep.${NC}"
+                    else
+                        echo -e "${RED}Loi: $DH_RESULT${NC}"
+                    fi
+                elif [ -n "$DH_IDX" ]; then
+                    echo -e "${RED}So thu tu khong hop le.${NC}"
+                fi
+                ;;
+            4)
+                return
+                ;;
+            *)
+                echo -e "${RED}Lua chon khong hop le.${NC}"
+                ;;
+        esac
+        echo ""
+    done
 }
 
 signing_key_menu() {
@@ -420,9 +614,10 @@ while true; do
     echo "  5) Xem log realtime (Ctrl+C de quay lai menu)"
     echo "  6) Restart service"
     echo "  7) Quan ly Signing Key (Export/Import giua cac VPS)"
-    echo "  8) Thoat"
+    echo "  8) Quan ly DEX Hash Allow-list (/api/dex-verify)"
+    echo "  9) Thoat"
     echo ""
-    read -p "Nhap lua chon [1-8]: " CHOICE
+    read -p "Nhap lua chon [1-9]: " CHOICE
     echo ""
 
     case "$CHOICE" in
@@ -479,6 +674,9 @@ while true; do
             signing_key_menu
             ;;
         8)
+            dex_hash_menu
+            ;;
+        9)
             echo "Tam biet."
             exit 0
             ;;
@@ -492,7 +690,7 @@ TKEOF
 
 chmod +x "$INSTALL_DIR/mtunnel-menu.sh"
 ln -sf "$INSTALL_DIR/mtunnel-menu.sh" /usr/local/bin/mtunnel-token
-log "Menu quan ly tong hop da tao — go 'mtunnel-token' de mo (doi token/pubkey/TLS pin/health/log/restart/signing-key)"
+log "Menu quan ly tong hop da tao — go 'mtunnel-token' de mo (doi token/pubkey/TLS pin/health/log/restart/signing-key/dex-hash)"
 
 # ── 6. Systemd service ──────────────────────────────────────
 log "Tao systemd service..."
