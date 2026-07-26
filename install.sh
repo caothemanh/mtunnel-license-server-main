@@ -287,6 +287,7 @@ TOKEN_FILE="$INSTALL_DIR/.token"
 CONFIG_FILE="$INSTALL_DIR/.config"
 SIGNING_KEY_FILE="$INSTALL_DIR/.signing_key"
 DEX_HASHES_FILE="$INSTALL_DIR/.dex_hashes.json"
+DEVICE_WHITELIST_FILE="$INSTALL_DIR/.attestation_whitelist.json"
 APK_UPLOAD_DIR="$INSTALL_DIR/apk_uploads"
 mkdir -p "$APK_UPLOAD_DIR"
 chown www-data:www-data "$APK_UPLOAD_DIR" 2>/dev/null || true
@@ -532,6 +533,139 @@ dex_hash_menu() {
     done
 }
 
+list_whitelist_devices() {
+    python3 - "$DEVICE_WHITELIST_FILE" << 'PYEOF'
+import sys, json
+try:
+    with open(sys.argv[1]) as f:
+        allowed = json.load(f).get("allowed_device_ids", [])
+except Exception:
+    allowed = []
+if not allowed:
+    print("(chua co device id nao trong whitelist)")
+else:
+    for i, d in enumerate(allowed, 1):
+        print(f"  {i}) {d}")
+PYEOF
+}
+
+add_whitelist_device() {
+    local device_id="$1"
+    python3 - "$DEVICE_WHITELIST_FILE" "$device_id" << 'PYEOF'
+import sys, json, os
+path, new_id = sys.argv[1], sys.argv[2]
+try:
+    with open(path) as f:
+        doc = json.load(f)
+except Exception:
+    doc = {"allowed_device_ids": []}
+allowed = doc.setdefault("allowed_device_ids", [])
+if new_id in allowed:
+    print("DUPLICATE")
+else:
+    allowed.append(new_id)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(doc, f, indent=2)
+    os.replace(tmp, path)
+    print("ADDED")
+PYEOF
+}
+
+remove_whitelist_device_by_index() {
+    local idx="$1"
+    python3 - "$DEVICE_WHITELIST_FILE" "$idx" << 'PYEOF'
+import sys, json, os
+path, idx = sys.argv[1], int(sys.argv[2])
+try:
+    with open(path) as f:
+        doc = json.load(f)
+except Exception:
+    print("ERROR:file_not_found")
+    sys.exit(1)
+allowed = doc.get("allowed_device_ids", [])
+if idx < 1 or idx > len(allowed):
+    print("ERROR:invalid_index")
+    sys.exit(1)
+removed = allowed.pop(idx - 1)
+tmp = path + ".tmp"
+with open(tmp, "w") as f:
+    json.dump(doc, f, indent=2)
+os.replace(tmp, path)
+print(f"REMOVED:{removed}")
+PYEOF
+}
+
+attestation_whitelist_menu() {
+    while true; do
+        echo -e "${CYAN}${BOLD}--- Quan ly Attestation Whitelist (bo qua Key Attestation theo device_id) ---${NC}"
+        echo ""
+        echo -e "${YELLOW}Thiet bi trong danh sach nay se duoc /api/config bo qua yeu cau${NC}"
+        echo -e "${YELLOW}Key Attestation (bootloader khoa + Verified Boot) — dung cho may${NC}"
+        echo -e "${YELLOW}root/da mo khoa bootloader can hoat dong duoc (vd may dev/tester).${NC}"
+        echo -e "${RED}Chi nen whitelist may cu the, KHONG nen dung dai tra vi se mat${NC}"
+        echo -e "${RED}tac dung chong root/patch cua co che attestation.${NC}"
+        echo ""
+        echo "  1) Nhap device_id tu client de them vao whitelist"
+        echo "  2) Xem danh sach device_id dang duoc whitelist"
+        echo "  3) Xoa 1 device_id khoi whitelist"
+        echo "  4) Quay lai"
+        echo ""
+        read -p "Chon [1-4]: " WL_CHOICE
+        echo ""
+        case "$WL_CHOICE" in
+            1)
+                echo -e "${CYAN}Huong dan lay device_id:${NC}"
+                echo "  1. Chay app tren thiet bi can whitelist"
+                echo "  2. device_id duoc app gui kem trong request /api/config"
+                echo "     (xem trong log server: journalctl -u mtunnel-license -f)"
+                echo "  3. Copy device_id roi paste vao day"
+                echo ""
+                read -p "Nhap device_id: " NEW_DEVICE_ID
+                if [ -z "$NEW_DEVICE_ID" ]; then
+                    echo -e "${RED}device_id khong duoc de trong!${NC}"
+                else
+                    WL_RESULT=$(add_whitelist_device "$NEW_DEVICE_ID")
+                    chmod 600 "$DEVICE_WHITELIST_FILE" 2>/dev/null || true
+                    chown www-data:www-data "$DEVICE_WHITELIST_FILE" 2>/dev/null || true
+                    if [ "$WL_RESULT" == "ADDED" ]; then
+                        echo -e "${GREEN}✅ Da them device_id vao whitelist (khong can restart service).${NC}"
+                        echo -e "${YELLOW}Thiet bi nay gio se bo qua yeu cau Key Attestation khi goi /api/config.${NC}"
+                    else
+                        echo -e "${YELLOW}device_id nay da co san trong whitelist roi.${NC}"
+                    fi
+                fi
+                ;;
+            2)
+                list_whitelist_devices
+                ;;
+            3)
+                list_whitelist_devices
+                echo ""
+                read -p "Nhap so thu tu muon xoa (Enter de huy): " WL_IDX
+                if [ -n "$WL_IDX" ] && [[ "$WL_IDX" =~ ^[0-9]+$ ]]; then
+                    WL_RESULT=$(remove_whitelist_device_by_index "$WL_IDX")
+                    if [[ "$WL_RESULT" == REMOVED:* ]]; then
+                        echo -e "${GREEN}✅ Da xoa: ${WL_RESULT#REMOVED:}${NC}"
+                        echo -e "${YELLOW}Thiet bi nay se phai qua Key Attestation binh thuong tu lan goi sau.${NC}"
+                    else
+                        echo -e "${RED}Loi: $WL_RESULT${NC}"
+                    fi
+                elif [ -n "$WL_IDX" ]; then
+                    echo -e "${RED}So thu tu khong hop le.${NC}"
+                fi
+                ;;
+            4)
+                return
+                ;;
+            *)
+                echo -e "${RED}Lua chon khong hop le.${NC}"
+                ;;
+        esac
+        echo ""
+    done
+}
+
 signing_key_menu() {
     echo -e "${CYAN}${BOLD}--- Quan ly Signing Key (Ed25519) ---${NC}"
     echo ""
@@ -615,9 +749,10 @@ while true; do
     echo "  6) Restart service"
     echo "  7) Quan ly Signing Key (Export/Import giua cac VPS)"
     echo "  8) Quan ly DEX Hash Allow-list (/api/dex-verify)"
-    echo "  9) Thoat"
+    echo "  9) Quan ly Attestation Whitelist (cho phep may root hoat dong)"
+    echo "  10) Thoat"
     echo ""
-    read -p "Nhap lua chon [1-9]: " CHOICE
+    read -p "Nhap lua chon [1-10]: " CHOICE
     echo ""
 
     case "$CHOICE" in
@@ -677,6 +812,9 @@ while true; do
             dex_hash_menu
             ;;
         9)
+            attestation_whitelist_menu
+            ;;
+        10)
             echo "Tam biet."
             exit 0
             ;;
@@ -690,7 +828,7 @@ TKEOF
 
 chmod +x "$INSTALL_DIR/mtunnel-menu.sh"
 ln -sf "$INSTALL_DIR/mtunnel-menu.sh" /usr/local/bin/mtunnel-token
-log "Menu quan ly tong hop da tao — go 'mtunnel-token' de mo (doi token/pubkey/TLS pin/health/log/restart/signing-key/dex-hash)"
+log "Menu quan ly tong hop da tao — go 'mtunnel-token' de mo (doi token/pubkey/TLS pin/health/log/restart/signing-key/dex-hash/attestation-whitelist)"
 
 # ── 6. Systemd service ──────────────────────────────────────
 log "Tao systemd service..."
