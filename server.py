@@ -6,6 +6,10 @@ import logging, os, time, json, queue, threading, base64, hmac, urllib.request, 
 
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from cryptography.hazmat.primitives import serialization
+from cryptography import x509
+from cryptography.hazmat.primitives.serialization import Encoding
+from cryptography.hazmat.primitives.asymmetric import rsa, ec, padding
+from cryptography.exceptions import InvalidSignature
 
 app = Flask(__name__)
 
@@ -40,11 +44,23 @@ DEX_HASHES_FILE   = os.path.join(INSTALL_DIR, ".dex_hashes.json")
 CACHE_TTL        = 3600
 GITHUB_FETCH_TTL = 60
 DEX_NONCE_TTL    = 60   # nonce phải được dùng trong 60s, dùng 1 lần rồi bỏ
+ATTESTATION_NONCE_TTL       = 60
+ATTESTATION_ROOT_CACHE_TTL  = 86400   # 24h — danh sách root Google ít khi đổi
+                                        # (nhưng CÓ đổi, như đợt rotate 4/2026,
+                                        # nên KHÔNG hardcode cứng, luôn fetch lại
+                                        # định kỳ thay vì fix 1 lần rồi thôi)
+GOOGLE_ATTESTATION_ROOT_URL = "https://android.googleapis.com/attestation/root"
 
 # nonce đang "sống" (đã phát cho app, chưa được app dùng để verify)
 # -> chống replay: 1 nonce chỉ đổi lấy được 1 câu trả lời đã ký duy nhất.
 _dex_nonces = {}
 _dex_nonce_lock = threading.Lock()
+
+_attestation_nonces = {}
+_attestation_nonce_lock = threading.Lock()
+
+_attestation_roots_cache = {"certs": [], "fetched_at": 0}
+_attestation_roots_lock = threading.Lock()
 
 _github_cache = {"bytes": None, "fetched_at": 0}
 
@@ -294,7 +310,11 @@ def dex_challenge():
 
     ok, reason = _check_auth(token, pkg)
     if not ok:
-        app.logger.warning(f"[dex-challenge] DENIED {ip}: {reason}")
+        # DEBUG TẠM THỜI — in token rút gọn (an toàn, không lộ toàn bộ) để
+        # so sánh trực tiếp với token đang hoạt động ở /api/config. XOÁ
+        # dòng debug_token này sau khi tìm ra nguyên nhân.
+        debug_token = (token[:8] + "...") if token else "(RỖNG)"
+        app.logger.warning(f"[dex-challenge] DENIED {ip}: {reason} | token_nhan_duoc={debug_token} | pkg_nhan_duoc={pkg or '(RỖNG)'}")
         return jsonify({"error": reason}), 403
 
     _dex_nonce_cleanup()
@@ -351,20 +371,380 @@ def dex_verify():
     })
 
 
+def _get_google_attestation_roots():
+    """
+    Tải danh sách root cert Key Attestation chính thức từ Google, cache lại
+    ATTESTATION_ROOT_CACHE_TTL giây. KHÔNG hardcode cứng bytes cert trong
+    code — Google ĐÃ từng đổi root (rotate tháng 4/2026), hardcode sẽ lỗi
+    thời và làm mọi verify sau đó fail cứng mà không rõ lý do.
+    """
+    now = time.time()
+    with _attestation_roots_lock:
+        if _attestation_roots_cache["certs"] and \
+           (now - _attestation_roots_cache["fetched_at"] < ATTESTATION_ROOT_CACHE_TTL):
+            return _attestation_roots_cache["certs"]
+
+    try:
+        req = urllib.request.Request(
+            GOOGLE_ATTESTATION_ROOT_URL,
+            headers={"User-Agent": "mtunnel-license-server/1.0"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            pem_list = json.loads(resp.read().decode())
+        certs = [x509.load_pem_x509_certificate(pem.encode()) for pem in pem_list]
+        with _attestation_roots_lock:
+            _attestation_roots_cache["certs"] = certs
+            _attestation_roots_cache["fetched_at"] = now
+        app.logger.info(f"[attestation] Da tai {len(certs)} root cert tu Google")
+        return certs
+    except Exception as e:
+        app.logger.error(f"[attestation] Loi tai root cert tu Google: {e}")
+        # Dùng cache cũ (dù hết hạn) thay vì fail cứng toàn bộ tính năng chỉ
+        # vì 1 lần Google tạm không phản hồi được.
+        with _attestation_roots_lock:
+            return list(_attestation_roots_cache["certs"])
+
+
+# ══════════════════════════════════════════════════════════════
+# MINI DER PARSER — chỉ đủ dùng để đọc cấu trúc KeyDescription
+# (extension Key Attestation, OID 1.3.6.1.4.1.11129.2.1.17), KHÔNG phải
+# 1 parser ASN.1 tổng quát. Xem cấu trúc đầy đủ tại:
+# https://source.android.com/docs/security/features/keystore/attestation
+# ══════════════════════════════════════════════════════════════
+
+KEY_DESCRIPTION_OID = "1.3.6.1.4.1.11129.2.1.17"
+ROOT_OF_TRUST_TAG   = 704   # context tag [704] EXPLICIT trong AuthorizationList
+
+
+class AttestationParseError(Exception):
+    pass
+
+
+def _der_read_tlv(data: bytes, offset: int):
+    """Đọc 1 TLV tại offset. Trả về (tag_number, tag_class, is_constructed, content, next_offset)."""
+    tag_byte = data[offset]
+    tag_class = (tag_byte & 0xC0) >> 6     # 0=universal 1=application 2=context-specific 3=private
+    is_constructed = bool(tag_byte & 0x20)
+    tag_number = tag_byte & 0x1F
+    offset += 1
+    if tag_number == 0x1F:                  # long-form tag number (cần cho tag > 30, vd [704])
+        tag_number = 0
+        while True:
+            b = data[offset]
+            tag_number = (tag_number << 7) | (b & 0x7F)
+            offset += 1
+            if not (b & 0x80):
+                break
+    length_byte = data[offset]
+    offset += 1
+    if length_byte & 0x80:
+        num_len_bytes = length_byte & 0x7F
+        length = int.from_bytes(data[offset:offset + num_len_bytes], "big")
+        offset += num_len_bytes
+    else:
+        length = length_byte
+    content = data[offset:offset + length]
+    return tag_number, tag_class, is_constructed, content, offset + length
+
+
+def _der_read_sequence_items(content: bytes):
+    """Parse nội dung 1 SEQUENCE thành list (tag, tag_class, constructed, item_content)."""
+    items = []
+    offset = 0
+    while offset < len(content):
+        tag, tag_class, constructed, item_content, next_offset = _der_read_tlv(content, offset)
+        items.append((tag, tag_class, constructed, item_content))
+        offset = next_offset
+    return items
+
+
+def _parse_key_attestation_extension(leaf_cert):
+    """
+    Parse extension KeyDescription trong leaf cert, trả về dict:
+      attestation_challenge (bytes), device_locked (bool),
+      verified_boot_state (int: 0=Verified,1=SelfSigned,2=Unverified,3=Failed)
+    """
+    try:
+        ext = leaf_cert.extensions.get_extension_for_oid(x509.ObjectIdentifier(KEY_DESCRIPTION_OID))
+    except x509.ExtensionNotFound:
+        raise AttestationParseError("khong_co_extension_key_attestation")
+
+    raw = ext.value.value   # UnrecognizedExtension.value = DER bytes thô của KeyDescription SEQUENCE
+
+    top_items = _der_read_sequence_items(raw)
+    # KeyDescription ::= SEQUENCE { attestationVersion, attestationSecurityLevel,
+    #   keymasterVersion, keymasterSecurityLevel, attestationChallenge,
+    #   uniqueId, softwareEnforced, teeEnforced }
+    if len(top_items) < 8:
+        raise AttestationParseError("key_description_thieu_truong")
+
+    attestation_challenge = top_items[4][3]
+    tee_enforced_content = top_items[7][3]
+    tee_items = _der_read_sequence_items(tee_enforced_content)
+
+    root_of_trust_content = None
+    for tag, tag_class, constructed, content in tee_items:
+        if tag_class == 2 and tag == ROOT_OF_TRUST_TAG:   # context-specific [704]
+            # [704] EXPLICIT bọc 1 TLV bên trong = chính RootOfTrust SEQUENCE
+            _, _, _, inner_content, _ = _der_read_tlv(content, 0)
+            root_of_trust_content = inner_content
+            break
+
+    if root_of_trust_content is None:
+        raise AttestationParseError("khong_tim_thay_root_of_trust_trong_tee_enforced")
+
+    rot_items = _der_read_sequence_items(root_of_trust_content)
+    # RootOfTrust ::= SEQUENCE { verifiedBootKey OCTET STRING, deviceLocked BOOLEAN,
+    #                            verifiedBootState ENUMERATED, verifiedBootHash OCTET STRING (optional) }
+    if len(rot_items) < 3:
+        raise AttestationParseError("root_of_trust_thieu_truong")
+
+    device_locked_bytes = rot_items[1][3]
+    verified_boot_state_bytes = rot_items[2][3]
+
+    return {
+        "attestation_challenge": attestation_challenge,
+        "device_locked": device_locked_bytes != b"\x00",
+        "verified_boot_state": int.from_bytes(verified_boot_state_bytes, "big"),
+    }
+
+
+def _verify_cert_signed_by(child_cert, parent_pubkey):
+    """Raise InvalidSignature nếu child_cert KHÔNG được ký bởi parent_pubkey."""
+    if isinstance(parent_pubkey, rsa.RSAPublicKey):
+        parent_pubkey.verify(
+            child_cert.signature, child_cert.tbs_certificate_bytes,
+            padding.PKCS1v15(), child_cert.signature_hash_algorithm)
+    elif isinstance(parent_pubkey, ec.EllipticCurvePublicKey):
+        parent_pubkey.verify(
+            child_cert.signature, child_cert.tbs_certificate_bytes,
+            ec.ECDSA(child_cert.signature_hash_algorithm))
+    else:
+        raise ValueError("loai_khoa_khong_ho_tro")
+
+
+def _verify_attestation_chain(cert_chain_der_list):
+    """
+    cert_chain_der_list: list bytes DER, thứ tự leaf -> ... -> root (đúng thứ
+    tự KeyStore.getCertificateChain() trả về trên Android).
+    Trả về (True, None, leaf_cert) nếu hợp lệ, ngược lại (False, reason, None).
+    """
+    if len(cert_chain_der_list) < 2:
+        return False, "chain_qua_ngan", None
+
+    try:
+        certs = [x509.load_der_x509_certificate(der) for der in cert_chain_der_list]
+    except Exception as e:
+        return False, f"loi_parse_cert:{e}", None
+
+    for i in range(len(certs) - 1):
+        try:
+            _verify_cert_signed_by(certs[i], certs[i + 1].public_key())
+        except InvalidSignature:
+            return False, f"chu_ky_sai_vi_tri_{i}", None
+        except Exception as e:
+            return False, f"loi_verify_vi_tri_{i}:{e}", None
+
+    google_roots = _get_google_attestation_roots()
+    if not google_roots:
+        return False, "khong_tai_duoc_root_google", None
+
+    root_der = certs[-1].public_bytes(Encoding.DER)
+    is_trusted = any(root_der == g.public_bytes(Encoding.DER) for g in google_roots)
+    if not is_trusted:
+        return False, "root_khong_khop_google", None
+
+    return True, None, certs[0]
+
+
+@app.route("/api/attestation-challenge", methods=["POST"])
+@limiter.limit("30 per minute")
+def attestation_challenge():
+    data = request.get_json(force=True, silent=True) or {}
+    token = data.get("token", "")
+    pkg = data.get("pkg", "")
+    ip = request.remote_addr
+
+    ok, reason = _check_auth(token, pkg)
+    if not ok:
+        app.logger.warning(f"[attestation-challenge] DENIED {ip}: {reason}")
+        return jsonify({"error": reason}), 403
+
+    now = time.time()
+    with _attestation_nonce_lock:
+        expired = [n for n, exp in _attestation_nonces.items() if exp < now]
+        for n in expired:
+            del _attestation_nonces[n]
+
+    nonce_bytes = os.urandom(32)
+    nonce_b64 = base64.b64encode(nonce_bytes).decode()
+    with _attestation_nonce_lock:
+        _attestation_nonces[nonce_b64] = now + ATTESTATION_NONCE_TTL
+
+    return jsonify({"challenge": nonce_b64, "expires_in": ATTESTATION_NONCE_TTL})
+
+
+@app.route("/api/attestation-verify", methods=["POST"])
+@limiter.limit("30 per minute")
+def attestation_verify():
+    data = request.get_json(force=True, silent=True) or {}
+    token = data.get("token", "")
+    pkg = data.get("pkg", "")
+    challenge_b64 = data.get("challenge", "")
+    cert_chain_b64 = data.get("cert_chain", [])
+    ip = request.remote_addr
+
+    ok, reason = _check_auth(token, pkg)
+    if not ok:
+        app.logger.warning(f"[attestation-verify] AUTH FAILED {ip}: {reason}")
+        return jsonify({"valid": False, "reason": reason})
+
+    with _attestation_nonce_lock:
+        expire_at = _attestation_nonces.pop(challenge_b64, None)
+    if expire_at is None or expire_at < time.time():
+        app.logger.warning(f"[attestation-verify] REJECT {ip}: bad_or_expired_challenge")
+        return jsonify({"valid": False, "reason": "bad_or_expired_challenge"})
+
+    if not isinstance(cert_chain_b64, list) or len(cert_chain_b64) < 2:
+        return jsonify({"valid": False, "reason": "cert_chain_thieu_hoac_sai_dang"})
+
+    try:
+        cert_chain_der = [base64.b64decode(c) for c in cert_chain_b64]
+    except Exception:
+        return jsonify({"valid": False, "reason": "cert_chain_base64_sai"})
+
+    chain_ok, chain_reason, leaf_cert = _verify_attestation_chain(cert_chain_der)
+    if not chain_ok:
+        app.logger.warning(f"[attestation-verify] REJECT {ip}: {chain_reason}")
+        return jsonify({"valid": False, "reason": chain_reason})
+
+    try:
+        parsed = _parse_key_attestation_extension(leaf_cert)
+    except AttestationParseError as e:
+        app.logger.warning(f"[attestation-verify] REJECT {ip}: parse_error={e}")
+        return jsonify({"valid": False, "reason": f"parse_error:{e}"})
+
+    expected_challenge = base64.b64decode(challenge_b64)
+    if not hmac.compare_digest(parsed["attestation_challenge"], expected_challenge):
+        app.logger.warning(f"[attestation-verify] REJECT {ip}: challenge_mismatch")
+        return jsonify({"valid": False, "reason": "challenge_mismatch"})
+
+    # verifiedBootState 0 = Verified (bootloader khoá, ROM gốc nhà sản xuất).
+    # deviceLocked = true nghĩa là bootloader đang ở trạng thái khoá tại
+    # thời điểm tạo khoá này.
+    is_valid = (parsed["verified_boot_state"] == 0) and parsed["device_locked"]
+
+    result_payload = {
+        "valid": is_valid,
+        "pkg": pkg,
+        "verified_boot_state": parsed["verified_boot_state"],
+        "device_locked": parsed["device_locked"],
+        "challenge": challenge_b64,
+        "ts": int(time.time()),
+    }
+    message = json.dumps(result_payload, sort_keys=True, separators=(",", ":")).encode()
+    signature = SIGNING_KEY.sign(message)
+
+    if is_valid:
+        app.logger.info(f"[attestation-verify] OK {ip} | pkg={pkg}")
+    else:
+        app.logger.warning(
+            f"[attestation-verify] NOT_VERIFIED {ip} | pkg={pkg} | "
+            f"boot_state={parsed['verified_boot_state']} | locked={parsed['device_locked']}")
+
+    return jsonify({
+        "result": base64.b64encode(message).decode(),
+        "signature": base64.b64encode(signature).decode(),
+    })
+
+
+ATTESTATION_TICKET_MAX_AGE = 300   # 5 phút — vé attestation cũ hơn mức này bị coi là hết hạn
+DEVICE_WHITELIST_FILE = os.path.join(INSTALL_DIR, ".attestation_whitelist.json")
+
+
+def _is_device_whitelisted(device_id: str) -> bool:
+    """
+    Whitelist theo Android ID — dùng cho máy dev/tester CỤ THỂ cần bỏ qua
+    yêu cầu Key Attestation (vd máy root để debug), KHÔNG áp dụng đại trà.
+    Quản lý qua menu 'mtunnel-token' -> Attestation Whitelist.
+    """
+    if not device_id:
+        return False
+    try:
+        with open(DEVICE_WHITELIST_FILE, "r") as f:
+            allowed = json.load(f).get("allowed_device_ids", [])
+        return device_id in allowed
+    except Exception:
+        return False
+
+
+def _verify_attestation_ticket(ticket_result_b64: str, ticket_signature_b64: str, expected_pkg: str):
+    """
+    Verify 1 "vé" attestation (payload đã ký từ /api/attestation-verify).
+    Trả về (True, None) nếu vé hợp lệ VÀ thiết bị đã attest thành công
+    (payload["valid"]==True), ngược lại (False, reason).
+    """
+    if not ticket_result_b64 or not ticket_signature_b64:
+        return False, "thieu_attestation_ticket"
+
+    try:
+        message = base64.b64decode(ticket_result_b64)
+        signature = base64.b64decode(ticket_signature_b64)
+    except Exception:
+        return False, "ticket_base64_sai"
+
+    try:
+        SIGNING_KEY.public_key().verify(signature, message)
+    except InvalidSignature:
+        return False, "ticket_chu_ky_sai"
+    except Exception as e:
+        return False, f"ticket_loi_verify:{e}"
+
+    try:
+        payload = json.loads(message.decode())
+    except Exception:
+        return False, "ticket_payload_khong_phai_json"
+
+    if payload.get("pkg") != expected_pkg:
+        return False, "ticket_sai_package"
+
+    ticket_age = time.time() - payload.get("ts", 0)
+    if ticket_age > ATTESTATION_TICKET_MAX_AGE or ticket_age < -10:
+        return False, "ticket_het_han"
+
+    if not payload.get("valid", False):
+        return False, "device_not_attested"
+
+    return True, None
+
+
 @app.route("/api/config", methods=["POST"])
 @limiter.limit("10 per minute")   # chặt hơn /api/verify vì đây là nơi lộ Servers array
 def get_config():
     data  = request.get_json(force=True, silent=True) or {}
     token = data.get("token", "")
     pkg   = data.get("pkg",   "")
+    ticket_result = data.get("attestation_ticket_result", "")
+    ticket_signature = data.get("attestation_ticket_signature", "")
+    device_id = data.get("device_id", "")
     ip    = request.remote_addr
 
-    app.logger.info(f"[config] {ip} | pkg={pkg} | token={token[:8]}...")
+    app.logger.info(f"[config] {ip} | pkg={pkg} | token={token[:8]}... | device_id={device_id or '(rong)'}")
 
     ok, reason = _check_auth(token, pkg)
     if not ok:
         app.logger.warning(f"[config] DENIED from {ip}: {reason}")
         return jsonify({"error": reason}), 403
+
+    if _is_device_whitelisted(device_id):
+        app.logger.info(f"[config] BYPASS attestation (whitelisted device_id={device_id}) {ip}")
+    else:
+        # Config chỉ được trả nếu kèm 1 vé Key Attestation còn hạn, đúng pkg,
+        # và server tự verify chữ ký (KHÔNG tin app tự khai báo gì cả) — đây
+        # mới là điểm ép buộc thật, không phải 1 check nằm rời rạc trong app.
+        ticket_ok, ticket_reason = _verify_attestation_ticket(ticket_result, ticket_signature, pkg)
+        if not ticket_ok:
+            app.logger.warning(f"[config] DENIED (attestation) from {ip}: {ticket_reason} | device_id={device_id or '(rong)'}")
+            return jsonify({"error": ticket_reason}), 403
 
     config_bytes = _get_config_bytes()
     if config_bytes is None:
