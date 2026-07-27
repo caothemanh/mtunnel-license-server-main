@@ -731,7 +731,16 @@ def attestation_verify():
     })
 
 
-ATTESTATION_TICKET_MAX_AGE = 300   # 5 phút — vé attestation cũ hơn mức này bị coi là hết hạn
+ATTESTATION_TICKET_MAX_AGE = 259200   # 3 ngay — vé attestation cũ hơn mức này bị coi là hết hạn.
+# Truoc la 300s (5 phut), buoc client phai tao key attestation moi (generateKeyPair)
+# gan nhu moi lan mo app. Tren Android 16 (bat buoc dung RKP, khong con factory
+# key), buoc tao key nay co the mat toi ~30s neu kho cert RKP da cap san bi can
+# va thiet bi phai xin cert moi qua mang tu server Google. Trang thai root/
+# bootloader cua may khong doi nhanh, nen nang TTL len de client cache va tai
+# su dung 1 ticket lau dai, chi phai tra gia cham 1 lan hiem hoi thay vi moi
+# lan mo app. Client (Android) can luu attestation_ticket_result/signature
+# kem timestamp, chi goi lai /api/attestation-challenge + /api/attestation-verify
+# khi ticket gan het han.
 DEVICE_WHITELIST_FILE = os.path.join(INSTALL_DIR, ".attestation_whitelist.json")
 
 
