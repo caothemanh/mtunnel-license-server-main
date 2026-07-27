@@ -2,7 +2,7 @@
 from flask import Flask, request, jsonify, Response, stream_with_context
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
-import logging, os, time, json, queue, threading, base64, hmac, urllib.request, urllib.error
+import logging, os, time, json, queue, threading, base64, hmac, hashlib, urllib.request, urllib.error
 
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from cryptography.hazmat.primitives import serialization
@@ -183,10 +183,10 @@ def _fetch_config_from_github():
     try:
         with urllib.request.urlopen(req, timeout=10) as resp:
             data = resp.read()
-            # KHÔNG validate bằng json.loads() ở đây — nội dung thật là
-            # ciphertext (AESCrypt.encrypt() từ Gen tool), không phải JSON
-            # thô, nên json.loads() luôn fail dù tải về đúng. Server chỉ
-            # cần coi đây là bytes bất kỳ để ký, không quan tâm định dạng.
+            # KHÔNG validate bằng json.loads() ở đây — server không quan tâm
+            # định dạng nội dung (JSON thô hay bất kỳ dạng nào Gen tool đẩy
+            # lên), chỉ coi đây là bytes bất kỳ để ký Ed25519 rồi forward
+            # nguyên vẹn cho client tự xử lý.
             if len(data) == 0:
                 app.logger.error("[config] GitHub tra ve file rong")
                 return None
@@ -219,7 +219,17 @@ def _get_config_bytes():
     app.logger.warning("[config] GitHub fetch that bai, dung ban cache local cu")
     try:
         with open(CONFIG_DATA_FILE, "rb") as f:
-            return f.read()
+            cached = f.read()
+        if len(cached) == 0:
+            # File cache local rong (vd server moi cai, chua tung fetch
+            # GitHub thanh cong lan nao) — KHONG duoc coi day la config
+            # hop le, neu khong se ky va tra ve "thanh cong" voi noi dung
+            # rong, khien client nhan duoc response hop le ve mat chu ky
+            # nhung noi dung trong -> crash/loi khi parse JSON rong o phia
+            # sau (Servers:[] khong ton tai).
+            app.logger.error("[config] File cache local cung rong — khong co config nao kha dung")
+            return None
+        return cached
     except:
         return None
 
@@ -468,13 +478,33 @@ def _parse_key_attestation_extension(leaf_cert):
     except x509.ExtensionNotFound:
         raise AttestationParseError("khong_co_extension_key_attestation")
 
-    raw = ext.value.value   # UnrecognizedExtension.value = DER bytes thô của KeyDescription SEQUENCE
+    raw = ext.value.value   # UnrecognizedExtension.value = DER bytes thô của KeyDescription (bao gồm cả tag+length của SEQUENCE ngoài cùng)
 
-    top_items = _der_read_sequence_items(raw)
+    # Bóc lớp TLV ngoài cùng (SEQUENCE) trước — "raw" là toàn bộ
+    # "30 82 xx xx <nội dung>", KHÔNG phải chỉ riêng phần nội dung.
+    _, _, _, key_description_content, _ = _der_read_tlv(raw, 0)
+    top_items = _der_read_sequence_items(key_description_content)
     # KeyDescription ::= SEQUENCE { attestationVersion, attestationSecurityLevel,
     #   keymasterVersion, keymasterSecurityLevel, attestationChallenge,
     #   uniqueId, softwareEnforced, teeEnforced }
     if len(top_items) < 8:
+        # DEBUG: log chi tiết cấu trúc thực tế đọc được để xác định schema
+        # KeyDescription của máy này khác bản hardcode 8-field ở chỗ nào —
+        # gỡ bỏ sau khi đã xác định xong nguyên nhân.
+        try:
+            attestation_version = None
+            if len(top_items) >= 1:
+                v_content = top_items[0][3]
+                attestation_version = int.from_bytes(v_content, "big") if v_content else None
+            app.logger.warning(
+                f"[attestation-verify] DEBUG key_description_thieu_truong | "
+                f"so_field_doc_duoc={len(top_items)} | "
+                f"attestation_version={attestation_version} | "
+                f"raw_len={len(raw)} | "
+                f"raw_hex_preview={raw[:64].hex()} | "
+                f"tags={[t[0] for t in top_items]}")
+        except Exception as e:
+            app.logger.warning(f"[attestation-verify] DEBUG log that bai: {e}")
         raise AttestationParseError("key_description_thieu_truong")
 
     attestation_challenge = top_items[4][3]
@@ -548,9 +578,50 @@ def _verify_attestation_chain(cert_chain_der_list):
     if not google_roots:
         return False, "khong_tai_duoc_root_google", None
 
-    root_der = certs[-1].public_bytes(Encoding.DER)
-    is_trusted = any(root_der == g.public_bytes(Encoding.DER) for g in google_roots)
+    # So theo PUBLIC KEY (SubjectPublicKeyInfo), KHÔNG so toàn bộ DER của cert.
+    # Google thỉnh thoảng "re-sign" lại cùng 1 root (cùng key, khác serial/hạn
+    # dùng) — Android tự khuyến nghị tin cậy theo subject/key bất kể validity
+    # period. So nguyên cert sẽ fail sai với các bản re-signed hợp lệ.
+    def _pubkey_der(cert):
+        return cert.public_key().public_bytes(Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo)
+
+    root_pubkey_der = _pubkey_der(certs[-1])
+    is_trusted = any(root_pubkey_der == _pubkey_der(g) for g in google_roots)
     if not is_trusted:
+        # DEBUG: log chi tiết root máy gửi lên vs danh sách root server đang
+        # cache, để xác định đây là do Google đang xoay vòng root (RKP) hay
+        # do lỗi khác — gỡ bỏ khối log này sau khi đã xác định xong nguyên nhân.
+        try:
+            def _not_after_iso(cert):
+                # cryptography >= 42.0 co not_valid_after_utc (aware datetime);
+                # ban cu hon chi co not_valid_after (naive datetime) — fallback
+                # de khong crash tren VPS dang dung version cu.
+                dt = getattr(cert, "not_valid_after_utc", None)
+                if dt is None:
+                    dt = cert.not_valid_after
+                return dt.isoformat()
+
+            device_root_fp = hashlib.sha256(certs[-1].public_bytes(Encoding.DER)).hexdigest()
+            device_root_subject = certs[-1].subject.rfc4514_string()
+            device_root_serial = certs[-1].serial_number
+            device_root_not_after = _not_after_iso(certs[-1])
+            app.logger.warning(
+                f"[attestation-verify] DEBUG root_khong_khop_google | "
+                f"device_root_subject='{device_root_subject}' | "
+                f"device_root_serial={device_root_serial} | "
+                f"device_root_not_after={device_root_not_after} | "
+                f"device_root_sha256={device_root_fp} | "
+                f"chain_len={len(certs)}")
+            for idx, g in enumerate(google_roots):
+                g_fp = hashlib.sha256(g.public_bytes(Encoding.DER)).hexdigest()
+                app.logger.warning(
+                    f"[attestation-verify] DEBUG server_cached_root[{idx}] | "
+                    f"subject='{g.subject.rfc4514_string()}' | "
+                    f"serial={g.serial_number} | "
+                    f"not_after={_not_after_iso(g)} | "
+                    f"sha256={g_fp}")
+        except Exception as e:
+            app.logger.warning(f"[attestation-verify] DEBUG log that bai: {e}")
         return False, "root_khong_khop_google", None
 
     return True, None, certs[0]
