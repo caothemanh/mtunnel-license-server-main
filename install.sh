@@ -288,6 +288,7 @@ CONFIG_FILE="$INSTALL_DIR/.config"
 SIGNING_KEY_FILE="$INSTALL_DIR/.signing_key"
 DEX_HASHES_FILE="$INSTALL_DIR/.dex_hashes.json"
 DEVICE_WHITELIST_FILE="$INSTALL_DIR/.attestation_whitelist.json"
+DEVICE_BLOCKED_FILE="$INSTALL_DIR/.attestation_blocked_devices.json"
 APK_UPLOAD_DIR="$INSTALL_DIR/apk_uploads"
 mkdir -p "$APK_UPLOAD_DIR"
 chown www-data:www-data "$APK_UPLOAD_DIR" 2>/dev/null || true
@@ -437,11 +438,50 @@ else:
 PYEOF
 }
 
-remove_dex_hash_by_index() {
-    local idx="$1"
-    python3 - "$DEX_HASHES_FILE" "$idx" << 'PYEOF'
+preview_dex_hash_selection() {
+    local idx_csv="$1"
+    python3 - "$DEX_HASHES_FILE" "$idx_csv" << 'PYEOF'
+import sys, json
+path, idx_csv = sys.argv[1], sys.argv[2]
+try:
+    with open(path) as f:
+        allowed = json.load(f).get("allowed", [])
+except Exception:
+    allowed = []
+if not allowed:
+    print("ERROR:empty")
+    sys.exit(1)
+if idx_csv.strip().lower() == "all":
+    selected = set(range(1, len(allowed) + 1))
+else:
+    selected = set()
+    for part in idx_csv.replace(" ", ",").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if not part.isdigit():
+            print(f"ERROR:invalid_index:{part}")
+            sys.exit(1)
+        selected.add(int(part))
+invalid = [i for i in selected if i < 1 or i > len(allowed)]
+if invalid:
+    print(f"ERROR:invalid_index:{','.join(map(str, sorted(invalid)))}")
+    sys.exit(1)
+if not selected:
+    print("ERROR:no_selection")
+    sys.exit(1)
+for i, h in enumerate(allowed, 1):
+    mark = "[x]" if i in selected else "[ ]"
+    print(f"{mark} {i}) {h}")
+print(f"COUNT:{len(selected)}")
+PYEOF
+}
+
+remove_dex_hashes_by_indices() {
+    local idx_csv="$1"
+    python3 - "$DEX_HASHES_FILE" "$idx_csv" << 'PYEOF'
 import sys, json, os
-path, idx = sys.argv[1], int(sys.argv[2])
+path, idx_csv = sys.argv[1], sys.argv[2]
 try:
     with open(path) as f:
         doc = json.load(f)
@@ -449,15 +489,31 @@ except Exception:
     print("ERROR:file_not_found")
     sys.exit(1)
 allowed = doc.get("allowed", [])
-if idx < 1 or idx > len(allowed):
-    print("ERROR:invalid_index")
+if idx_csv.strip().lower() == "all":
+    indices = set(range(1, len(allowed) + 1))
+else:
+    indices = set()
+    for part in idx_csv.replace(" ", ",").split(","):
+        part = part.strip()
+        if part:
+            indices.add(int(part))
+invalid = [i for i in indices if i < 1 or i > len(allowed)]
+if invalid:
+    print(f"ERROR:invalid_index:{','.join(map(str, sorted(invalid)))}")
     sys.exit(1)
-removed = allowed.pop(idx - 1)
+if not indices:
+    print("ERROR:no_selection")
+    sys.exit(1)
+removed = []
+for i in sorted(indices, reverse=True):
+    removed.append(allowed.pop(i - 1))
+removed.reverse()
 tmp = path + ".tmp"
 with open(tmp, "w") as f:
     json.dump(doc, f, indent=2)
 os.replace(tmp, path)
-print(f"REMOVED:{removed}")
+print("REMOVED:" + "|".join(removed))
+print(f"COUNT:{len(removed)}")
 PYEOF
 }
 
@@ -509,17 +565,37 @@ dex_hash_menu() {
             3)
                 list_dex_hashes
                 echo ""
-                read -p "Nhap so thu tu muon xoa (Enter de huy): " DH_IDX
-                if [ -n "$DH_IDX" ] && [[ "$DH_IDX" =~ ^[0-9]+$ ]]; then
-                    DH_RESULT=$(remove_dex_hash_by_index "$DH_IDX")
-                    if [[ "$DH_RESULT" == REMOVED:* ]]; then
-                        echo -e "${GREEN}✅ Da xoa: ${DH_RESULT#REMOVED:}${NC}"
-                        echo -e "${RED}App nao dang chay dung hash nay se bi kill trong lan check ke tiep.${NC}"
+                echo -e "${YELLOW}Nhap cac so muon xoa, cach nhau boi dau phay hoac khoang trang (vd: 1,3,5).${NC}"
+                echo -e "${YELLOW}Go 'all' de xoa tat ca. Enter de huy.${NC}"
+                read -p "Chon: " DH_IDX
+                if [ -n "$DH_IDX" ]; then
+                    DH_PREVIEW=$(preview_dex_hash_selection "$DH_IDX")
+                    if [[ "$DH_PREVIEW" == ERROR:empty* ]]; then
+                        echo -e "${RED}Danh sach dang trong.${NC}"
+                    elif [[ "$DH_PREVIEW" == ERROR:invalid_index* ]]; then
+                        echo -e "${RED}So thu tu khong hop le: ${DH_PREVIEW#ERROR:invalid_index:}${NC}"
+                    elif [[ "$DH_PREVIEW" == ERROR:no_selection* ]]; then
+                        echo -e "${RED}Chua chon muc nao.${NC}"
                     else
-                        echo -e "${RED}Loi: $DH_RESULT${NC}"
+                        echo ""
+                        echo -e "${CYAN}${BOLD}Danh sach da chon xoa:${NC}"
+                        echo "$DH_PREVIEW" | grep -v "^COUNT:"
+                        DH_SEL_COUNT=$(echo "$DH_PREVIEW" | grep "^COUNT:" | cut -d: -f2)
+                        echo ""
+                        read -p "Xac nhan xoa $DH_SEL_COUNT hash da chon? [y/N]: " DH_CONFIRM
+                        if [[ "$DH_CONFIRM" == "y" || "$DH_CONFIRM" == "Y" ]]; then
+                            DH_RESULT=$(remove_dex_hashes_by_indices "$DH_IDX")
+                            if [[ "$DH_RESULT" == *"REMOVED:"* ]]; then
+                                DH_RM_COUNT=$(echo "$DH_RESULT" | grep "^COUNT:" | cut -d: -f2)
+                                echo -e "${GREEN}✅ Da xoa $DH_RM_COUNT hash.${NC}"
+                                echo -e "${RED}App nao dang chay dung cac hash nay se bi kill trong lan check ke tiep.${NC}"
+                            else
+                                echo -e "${RED}Loi: $DH_RESULT${NC}"
+                            fi
+                        else
+                            echo -e "${YELLOW}Da huy.${NC}"
+                        fi
                     fi
-                elif [ -n "$DH_IDX" ]; then
-                    echo -e "${RED}So thu tu khong hop le.${NC}"
                 fi
                 ;;
             4)
@@ -572,11 +648,50 @@ else:
 PYEOF
 }
 
-remove_whitelist_device_by_index() {
-    local idx="$1"
-    python3 - "$DEVICE_WHITELIST_FILE" "$idx" << 'PYEOF'
+preview_whitelist_selection() {
+    local idx_csv="$1"
+    python3 - "$DEVICE_WHITELIST_FILE" "$idx_csv" << 'PYEOF'
+import sys, json
+path, idx_csv = sys.argv[1], sys.argv[2]
+try:
+    with open(path) as f:
+        allowed = json.load(f).get("allowed_device_ids", [])
+except Exception:
+    allowed = []
+if not allowed:
+    print("ERROR:empty")
+    sys.exit(1)
+if idx_csv.strip().lower() == "all":
+    selected = set(range(1, len(allowed) + 1))
+else:
+    selected = set()
+    for part in idx_csv.replace(" ", ",").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if not part.isdigit():
+            print(f"ERROR:invalid_index:{part}")
+            sys.exit(1)
+        selected.add(int(part))
+invalid = [i for i in selected if i < 1 or i > len(allowed)]
+if invalid:
+    print(f"ERROR:invalid_index:{','.join(map(str, sorted(invalid)))}")
+    sys.exit(1)
+if not selected:
+    print("ERROR:no_selection")
+    sys.exit(1)
+for i, d in enumerate(allowed, 1):
+    mark = "[x]" if i in selected else "[ ]"
+    print(f"{mark} {i}) {d}")
+print(f"COUNT:{len(selected)}")
+PYEOF
+}
+
+remove_whitelist_devices_by_indices() {
+    local idx_csv="$1"
+    python3 - "$DEVICE_WHITELIST_FILE" "$idx_csv" << 'PYEOF'
 import sys, json, os
-path, idx = sys.argv[1], int(sys.argv[2])
+path, idx_csv = sys.argv[1], sys.argv[2]
 try:
     with open(path) as f:
         doc = json.load(f)
@@ -584,16 +699,262 @@ except Exception:
     print("ERROR:file_not_found")
     sys.exit(1)
 allowed = doc.get("allowed_device_ids", [])
-if idx < 1 or idx > len(allowed):
-    print("ERROR:invalid_index")
+if idx_csv.strip().lower() == "all":
+    indices = set(range(1, len(allowed) + 1))
+else:
+    indices = set()
+    for part in idx_csv.replace(" ", ",").split(","):
+        part = part.strip()
+        if part:
+            indices.add(int(part))
+invalid = [i for i in indices if i < 1 or i > len(allowed)]
+if invalid:
+    print(f"ERROR:invalid_index:{','.join(map(str, sorted(invalid)))}")
     sys.exit(1)
-removed = allowed.pop(idx - 1)
+if not indices:
+    print("ERROR:no_selection")
+    sys.exit(1)
+removed = []
+for i in sorted(indices, reverse=True):
+    removed.append(allowed.pop(i - 1))
+removed.reverse()
 tmp = path + ".tmp"
 with open(tmp, "w") as f:
     json.dump(doc, f, indent=2)
 os.replace(tmp, path)
-print(f"REMOVED:{removed}")
+print("REMOVED:" + "|".join(removed))
+print(f"COUNT:{len(removed)}")
 PYEOF
+}
+
+list_blocked_devices() {
+    python3 - "$DEVICE_BLOCKED_FILE" << 'PYEOF'
+import sys, json, time
+try:
+    with open(sys.argv[1]) as f:
+        blocked = json.load(f).get("blocked", {})
+except Exception:
+    blocked = {}
+if not blocked:
+    print("(chua ghi nhan thiet bi nao bi chan)")
+else:
+    items = sorted(blocked.items(), key=lambda kv: kv[1].get("last_seen", 0), reverse=True)
+    for i, (device_id, info) in enumerate(items, 1):
+        last_seen = info.get("last_seen", 0)
+        last_seen_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(last_seen)) if last_seen else "?"
+        reason = info.get("reason", "khong_xac_dinh")
+        count = info.get("count", 1)
+        pkg = info.get("pkg", "?")
+        ip = info.get("last_ip", "?")
+        print(f"  {i}) {device_id}")
+        print(f"       ly_do={reason} | lan_cuoi={last_seen_str} | so_lan={count} | pkg={pkg} | ip={ip}")
+PYEOF
+}
+
+add_blocked_device_to_whitelist_by_index() {
+    local idx="$1"
+    python3 - "$DEVICE_BLOCKED_FILE" "$DEVICE_WHITELIST_FILE" "$idx" << 'PYEOF'
+import sys, json, os
+blocked_path, whitelist_path, idx = sys.argv[1], sys.argv[2], sys.argv[3]
+try:
+    with open(blocked_path) as f:
+        blocked = json.load(f).get("blocked", {})
+except Exception:
+    blocked = {}
+if not blocked:
+    print("ERROR:empty")
+    sys.exit(1)
+if not idx.isdigit():
+    print("ERROR:invalid_index")
+    sys.exit(1)
+idx = int(idx)
+items = sorted(blocked.items(), key=lambda kv: kv[1].get("last_seen", 0), reverse=True)
+if idx < 1 or idx > len(items):
+    print("ERROR:invalid_index")
+    sys.exit(1)
+device_id = items[idx - 1][0]
+try:
+    with open(whitelist_path) as f:
+        doc = json.load(f)
+except Exception:
+    doc = {"allowed_device_ids": []}
+allowed = doc.setdefault("allowed_device_ids", [])
+if device_id in allowed:
+    print(f"DUPLICATE:{device_id}")
+else:
+    allowed.append(device_id)
+    tmp = whitelist_path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(doc, f, indent=2)
+    os.replace(tmp, whitelist_path)
+    print(f"ADDED:{device_id}")
+PYEOF
+}
+
+preview_blocked_selection() {
+    local idx_csv="$1"
+    python3 - "$DEVICE_BLOCKED_FILE" "$idx_csv" << 'PYEOF'
+import sys, json
+path, idx_csv = sys.argv[1], sys.argv[2]
+try:
+    with open(path) as f:
+        blocked = json.load(f).get("blocked", {})
+except Exception:
+    blocked = {}
+if not blocked:
+    print("ERROR:empty")
+    sys.exit(1)
+items = sorted(blocked.items(), key=lambda kv: kv[1].get("last_seen", 0), reverse=True)
+if idx_csv.strip().lower() == "all":
+    selected = set(range(1, len(items) + 1))
+else:
+    selected = set()
+    for part in idx_csv.replace(" ", ",").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if not part.isdigit():
+            print(f"ERROR:invalid_index:{part}")
+            sys.exit(1)
+        selected.add(int(part))
+invalid = [i for i in selected if i < 1 or i > len(items)]
+if invalid:
+    print(f"ERROR:invalid_index:{','.join(map(str, sorted(invalid)))}")
+    sys.exit(1)
+if not selected:
+    print("ERROR:no_selection")
+    sys.exit(1)
+for i, (device_id, info) in enumerate(items, 1):
+    mark = "[x]" if i in selected else "[ ]"
+    print(f"{mark} {i}) {device_id} (ly_do={info.get('reason', '?')})")
+print(f"COUNT:{len(selected)}")
+PYEOF
+}
+
+clear_blocked_devices_by_indices() {
+    local idx_csv="$1"
+    python3 - "$DEVICE_BLOCKED_FILE" "$idx_csv" << 'PYEOF'
+import sys, json, os
+path, idx_csv = sys.argv[1], sys.argv[2]
+try:
+    with open(path) as f:
+        doc = json.load(f)
+except Exception:
+    print("ERROR:file_not_found")
+    sys.exit(1)
+blocked = doc.get("blocked", {})
+items = sorted(blocked.items(), key=lambda kv: kv[1].get("last_seen", 0), reverse=True)
+if idx_csv.strip().lower() == "all":
+    indices = set(range(1, len(items) + 1))
+else:
+    indices = set()
+    for part in idx_csv.replace(" ", ",").split(","):
+        part = part.strip()
+        if part:
+            indices.add(int(part))
+invalid = [i for i in indices if i < 1 or i > len(items)]
+if invalid:
+    print(f"ERROR:invalid_index:{','.join(map(str, sorted(invalid)))}")
+    sys.exit(1)
+if not indices:
+    print("ERROR:no_selection")
+    sys.exit(1)
+removed = []
+for i in indices:
+    device_id = items[i - 1][0]
+    removed.append(device_id)
+    blocked.pop(device_id, None)
+tmp = path + ".tmp"
+with open(tmp, "w") as f:
+    json.dump(doc, f, indent=2)
+os.replace(tmp, path)
+print("REMOVED:" + "|".join(removed))
+print(f"COUNT:{len(removed)}")
+PYEOF
+}
+
+blocked_devices_menu() {
+    while true; do
+        echo -e "${CYAN}${BOLD}--- Thiet bi bi chan (root / bootloader mo khoa) ---${NC}"
+        echo ""
+        echo -e "${YELLOW}Day la cac device_id ma server DA verify Key Attestation${NC}"
+        echo -e "${YELLOW}that (ve ky hop le) nhung bi tu choi vi root hoac bootloader${NC}"
+        echo -e "${YELLOW}dang mo khoa. Server tu dong ghi lai moi khi /api/config bi${NC}"
+        echo -e "${YELLOW}tu choi vi ly do nay — khong can lam gi them.${NC}"
+        echo ""
+        list_blocked_devices
+        echo ""
+        echo "  1) Them 1 thiet bi tu danh sach nay vao whitelist"
+        echo "  2) Xoa (don dep) khoi danh sach nay"
+        echo "  3) Quay lai"
+        echo ""
+        read -p "Chon [1-3]: " BD_CHOICE
+        echo ""
+        case "$BD_CHOICE" in
+            1)
+                read -p "Nhap so thu tu can them vao whitelist (Enter de huy): " BD_IDX
+                if [ -n "$BD_IDX" ] && [[ "$BD_IDX" =~ ^[0-9]+$ ]]; then
+                    BD_RESULT=$(add_blocked_device_to_whitelist_by_index "$BD_IDX")
+                    chmod 600 "$DEVICE_WHITELIST_FILE" 2>/dev/null || true
+                    chown www-data:www-data "$DEVICE_WHITELIST_FILE" 2>/dev/null || true
+                    case "$BD_RESULT" in
+                        ADDED:*)
+                            echo -e "${GREEN}✅ Da them ${BD_RESULT#ADDED:} vao whitelist.${NC}"
+                            echo -e "${YELLOW}Thiet bi nay se bo qua Key Attestation tu lan goi sau.${NC}"
+                            ;;
+                        DUPLICATE:*)
+                            echo -e "${YELLOW}${BD_RESULT#DUPLICATE:} da co san trong whitelist roi.${NC}"
+                            ;;
+                        *)
+                            echo -e "${RED}Loi: $BD_RESULT${NC}"
+                            ;;
+                    esac
+                elif [ -n "$BD_IDX" ]; then
+                    echo -e "${RED}So thu tu khong hop le.${NC}"
+                fi
+                ;;
+            2)
+                echo -e "${YELLOW}Nhap cac so muon xoa, cach nhau boi dau phay hoac khoang trang (vd: 1,3,5).${NC}"
+                echo -e "${YELLOW}Go 'all' de xoa tat ca. Enter de huy. (Chi xoa khoi log, khong anh huong whitelist)${NC}"
+                read -p "Chon: " BD_IDX
+                if [ -n "$BD_IDX" ]; then
+                    BD_PREVIEW=$(preview_blocked_selection "$BD_IDX")
+                    if [[ "$BD_PREVIEW" == ERROR:empty* ]]; then
+                        echo -e "${RED}Danh sach dang trong.${NC}"
+                    elif [[ "$BD_PREVIEW" == ERROR:invalid_index* ]]; then
+                        echo -e "${RED}So thu tu khong hop le: ${BD_PREVIEW#ERROR:invalid_index:}${NC}"
+                    elif [[ "$BD_PREVIEW" == ERROR:no_selection* ]]; then
+                        echo -e "${RED}Chua chon muc nao.${NC}"
+                    else
+                        echo ""
+                        echo -e "${CYAN}${BOLD}Danh sach da chon xoa:${NC}"
+                        echo "$BD_PREVIEW" | grep -v "^COUNT:"
+                        BD_SEL_COUNT=$(echo "$BD_PREVIEW" | grep "^COUNT:" | cut -d: -f2)
+                        echo ""
+                        read -p "Xac nhan xoa $BD_SEL_COUNT muc da chon khoi log? [y/N]: " BD_CONFIRM
+                        if [[ "$BD_CONFIRM" == "y" || "$BD_CONFIRM" == "Y" ]]; then
+                            BD_RM_RESULT=$(clear_blocked_devices_by_indices "$BD_IDX")
+                            if [[ "$BD_RM_RESULT" == *"REMOVED:"* ]]; then
+                                BD_RM_COUNT=$(echo "$BD_RM_RESULT" | grep "^COUNT:" | cut -d: -f2)
+                                echo -e "${GREEN}✅ Da xoa $BD_RM_COUNT muc khoi log.${NC}"
+                            else
+                                echo -e "${RED}Loi: $BD_RM_RESULT${NC}"
+                            fi
+                        else
+                            echo -e "${YELLOW}Da huy.${NC}"
+                        fi
+                    fi
+                fi
+                ;;
+            3)
+                return
+                ;;
+            *)
+                echo -e "${RED}Lua chon khong hop le.${NC}"
+                ;;
+        esac
+        echo ""
+    done
 }
 
 attestation_whitelist_menu() {
@@ -608,10 +969,11 @@ attestation_whitelist_menu() {
         echo ""
         echo "  1) Nhap device_id tu client de them vao whitelist"
         echo "  2) Xem danh sach device_id dang duoc whitelist"
-        echo "  3) Xoa 1 device_id khoi whitelist"
-        echo "  4) Quay lai"
+        echo "  3) Xoa device_id khoi whitelist"
+        echo "  4) Xem thiet bi bi chan (root / bootloader mo khoa)"
+        echo "  5) Quay lai"
         echo ""
-        read -p "Chon [1-4]: " WL_CHOICE
+        read -p "Chon [1-5]: " WL_CHOICE
         echo ""
         case "$WL_CHOICE" in
             1)
@@ -642,20 +1004,43 @@ attestation_whitelist_menu() {
             3)
                 list_whitelist_devices
                 echo ""
-                read -p "Nhap so thu tu muon xoa (Enter de huy): " WL_IDX
-                if [ -n "$WL_IDX" ] && [[ "$WL_IDX" =~ ^[0-9]+$ ]]; then
-                    WL_RESULT=$(remove_whitelist_device_by_index "$WL_IDX")
-                    if [[ "$WL_RESULT" == REMOVED:* ]]; then
-                        echo -e "${GREEN}✅ Da xoa: ${WL_RESULT#REMOVED:}${NC}"
-                        echo -e "${YELLOW}Thiet bi nay se phai qua Key Attestation binh thuong tu lan goi sau.${NC}"
+                echo -e "${YELLOW}Nhap cac so muon xoa, cach nhau boi dau phay hoac khoang trang (vd: 1,3,5).${NC}"
+                echo -e "${YELLOW}Go 'all' de xoa tat ca. Enter de huy.${NC}"
+                read -p "Chon: " WL_IDX
+                if [ -n "$WL_IDX" ]; then
+                    WL_PREVIEW=$(preview_whitelist_selection "$WL_IDX")
+                    if [[ "$WL_PREVIEW" == ERROR:empty* ]]; then
+                        echo -e "${RED}Danh sach dang trong.${NC}"
+                    elif [[ "$WL_PREVIEW" == ERROR:invalid_index* ]]; then
+                        echo -e "${RED}So thu tu khong hop le: ${WL_PREVIEW#ERROR:invalid_index:}${NC}"
+                    elif [[ "$WL_PREVIEW" == ERROR:no_selection* ]]; then
+                        echo -e "${RED}Chua chon muc nao.${NC}"
                     else
-                        echo -e "${RED}Loi: $WL_RESULT${NC}"
+                        echo ""
+                        echo -e "${CYAN}${BOLD}Danh sach da chon xoa:${NC}"
+                        echo "$WL_PREVIEW" | grep -v "^COUNT:"
+                        WL_SEL_COUNT=$(echo "$WL_PREVIEW" | grep "^COUNT:" | cut -d: -f2)
+                        echo ""
+                        read -p "Xac nhan xoa $WL_SEL_COUNT thiet bi da chon? [y/N]: " WL_CONFIRM
+                        if [[ "$WL_CONFIRM" == "y" || "$WL_CONFIRM" == "Y" ]]; then
+                            WL_RESULT=$(remove_whitelist_devices_by_indices "$WL_IDX")
+                            if [[ "$WL_RESULT" == *"REMOVED:"* ]]; then
+                                WL_RM_COUNT=$(echo "$WL_RESULT" | grep "^COUNT:" | cut -d: -f2)
+                                echo -e "${GREEN}✅ Da xoa $WL_RM_COUNT thiet bi.${NC}"
+                                echo -e "${YELLOW}Cac thiet bi nay se phai qua Key Attestation binh thuong tu lan goi sau.${NC}"
+                            else
+                                echo -e "${RED}Loi: $WL_RESULT${NC}"
+                            fi
+                        else
+                            echo -e "${YELLOW}Da huy.${NC}"
+                        fi
                     fi
-                elif [ -n "$WL_IDX" ]; then
-                    echo -e "${RED}So thu tu khong hop le.${NC}"
                 fi
                 ;;
             4)
+                blocked_devices_menu
+                ;;
+            5)
                 return
                 ;;
             *)

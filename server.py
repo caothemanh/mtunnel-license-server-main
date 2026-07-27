@@ -39,6 +39,7 @@ SIGNING_KEY_FILE  = os.path.join(INSTALL_DIR, ".signing_key")
 GITHUB_TOKEN_FILE = os.path.join(INSTALL_DIR, ".github_token")
 GITHUB_REPO_FILE  = os.path.join(INSTALL_DIR, ".github_repo")
 DEX_HASHES_FILE   = os.path.join(INSTALL_DIR, ".dex_hashes.json")
+DEVICE_BLOCKED_FILE = os.path.join(INSTALL_DIR, ".attestation_blocked_devices.json")
 
 
 CACHE_TTL        = 3600
@@ -61,6 +62,8 @@ _attestation_nonce_lock = threading.Lock()
 
 _attestation_roots_cache = {"certs": [], "fetched_at": 0}
 _attestation_roots_lock = threading.Lock()
+
+_device_blocked_lock = threading.Lock()
 
 _github_cache = {"bytes": None, "fetched_at": 0}
 
@@ -748,44 +751,89 @@ def _is_device_whitelisted(device_id: str) -> bool:
         return False
 
 
+def _record_blocked_device(device_id: str, ip: str, pkg: str, verified_boot_state, device_locked):
+    """
+    Ghi lai (hoac cap nhat) 1 thiet bi bi server tu choi cap config vi Key
+    Attestation phat hien root/mo khoa bootloader (attestation ticket hop
+    le nhung payload["valid"]==False). Danh sach nay CHI de xem lai qua
+    menu 'mtunnel-token' -> Attestation Whitelist, tien cho viec whitelist
+    nhanh 1 may cu the neu can — KHONG anh huong logic chan/cho phep.
+    """
+    if not device_id:
+        return
+    reasons = []
+    if device_locked is False:
+        reasons.append("bootloader_mo_khoa")
+    if verified_boot_state is not None and verified_boot_state != 0:
+        reasons.append("verified_boot_khong_hop_le")
+    if not reasons:
+        reasons.append("khong_xac_dinh")
+    reason = ",".join(reasons)
+
+    with _device_blocked_lock:
+        try:
+            with open(DEVICE_BLOCKED_FILE, "r") as f:
+                doc = json.load(f)
+        except Exception:
+            doc = {"blocked": {}}
+        blocked = doc.setdefault("blocked", {})
+        entry = blocked.setdefault(device_id, {"first_seen": int(time.time()), "count": 0})
+        entry["last_seen"] = int(time.time())
+        entry["count"] = entry.get("count", 0) + 1
+        entry["last_ip"] = ip
+        entry["pkg"] = pkg
+        entry["verified_boot_state"] = verified_boot_state
+        entry["device_locked"] = device_locked
+        entry["reason"] = reason
+        try:
+            tmp = DEVICE_BLOCKED_FILE + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(doc, f, indent=2)
+            os.replace(tmp, DEVICE_BLOCKED_FILE)
+        except Exception as e:
+            app.logger.error(f"[attestation-block] Loi ghi {DEVICE_BLOCKED_FILE}: {e}")
+
+
 def _verify_attestation_ticket(ticket_result_b64: str, ticket_signature_b64: str, expected_pkg: str):
     """
     Verify 1 "vé" attestation (payload đã ký từ /api/attestation-verify).
-    Trả về (True, None) nếu vé hợp lệ VÀ thiết bị đã attest thành công
-    (payload["valid"]==True), ngược lại (False, reason).
+    Trả về (True, None, payload) nếu vé hợp lệ VÀ thiết bị đã attest thành
+    công (payload["valid"]==True), ngược lại (False, reason, payload).
+    payload chỉ có giá trị (khác None) khi đã giải mã JSON thành công —
+    dùng để ghi lại lý do bị chặn (root/bootloader mở khóa) khi cần.
     """
     if not ticket_result_b64 or not ticket_signature_b64:
-        return False, "thieu_attestation_ticket"
+        return False, "thieu_attestation_ticket", None
 
     try:
         message = base64.b64decode(ticket_result_b64)
         signature = base64.b64decode(ticket_signature_b64)
     except Exception:
-        return False, "ticket_base64_sai"
+        return False, "ticket_base64_sai", None
 
     try:
         SIGNING_KEY.public_key().verify(signature, message)
     except InvalidSignature:
-        return False, "ticket_chu_ky_sai"
+        return False, "ticket_chu_ky_sai", None
     except Exception as e:
-        return False, f"ticket_loi_verify:{e}"
+        return False, f"ticket_loi_verify:{e}", None
 
     try:
         payload = json.loads(message.decode())
     except Exception:
-        return False, "ticket_payload_khong_phai_json"
+        return False, "ticket_payload_khong_phai_json", None
 
     if payload.get("pkg") != expected_pkg:
-        return False, "ticket_sai_package"
+        return False, "ticket_sai_package", payload
 
     ticket_age = time.time() - payload.get("ts", 0)
     if ticket_age > ATTESTATION_TICKET_MAX_AGE or ticket_age < -10:
-        return False, "ticket_het_han"
+        return False, "ticket_het_han", payload
 
     if not payload.get("valid", False):
-        return False, "device_not_attested"
+        return False, "device_not_attested", payload
 
-    return True, None
+    return True, None, payload
 
 
 @app.route("/api/config", methods=["POST"])
@@ -812,8 +860,19 @@ def get_config():
         # Config chỉ được trả nếu kèm 1 vé Key Attestation còn hạn, đúng pkg,
         # và server tự verify chữ ký (KHÔNG tin app tự khai báo gì cả) — đây
         # mới là điểm ép buộc thật, không phải 1 check nằm rời rạc trong app.
-        ticket_ok, ticket_reason = _verify_attestation_ticket(ticket_result, ticket_signature, pkg)
+        ticket_ok, ticket_reason, ticket_payload = _verify_attestation_ticket(ticket_result, ticket_signature, pkg)
         if not ticket_ok:
+            if ticket_reason == "device_not_attested" and ticket_payload is not None:
+                # Ve ky hop le, server DA verify duoc Key Attestation that,
+                # chi la boot_state/device_locked khong dat — day moi la
+                # bang chung thuc su may bi root/mo khoa bootloader, khac
+                # voi cac loi ve rach/het han/sai chu ky o tren (khong chung
+                # minh duoc gi ve tinh trang may).
+                _record_blocked_device(
+                    device_id, ip, pkg,
+                    ticket_payload.get("verified_boot_state"),
+                    ticket_payload.get("device_locked"),
+                )
             app.logger.warning(f"[config] DENIED (attestation) from {ip}: {ticket_reason} | device_id={device_id or '(rong)'}")
             return jsonify({"error": ticket_reason}), 403
 
