@@ -195,7 +195,7 @@ echo ""
 log "Cai dat dependencies..."
 apt update -qq
 apt install -y python3-pip python3-venv nginx curl > /dev/null 2>&1
-pip3 install flask gunicorn gevent cryptography -q
+pip3 install flask gunicorn gevent cryptography flask-limiter -q
 log "Dependencies da cai xong"
 
 # Mot so VPS (container/image toi gian) khong tao san /var/log/nginx du
@@ -1197,6 +1197,67 @@ with open('$SIGNING_KEY_FILE', 'wb') as f:
     esac
 }
 
+change_port_menu() {
+    echo -e "${CYAN}${BOLD}--- Doi port HTTPS ---${NC}"
+    echo ""
+    echo -e "Port hien tai: ${BOLD}$SSL_PORT${NC}"
+    echo ""
+    read -p "Nhap port moi (Enter de huy): " NEW_PORT
+    if [ -z "$NEW_PORT" ]; then
+        echo -e "${YELLOW}Da huy.${NC}"
+        return
+    fi
+    if ! [[ "$NEW_PORT" =~ ^[0-9]+$ ]] || [ "$NEW_PORT" -lt 1 ] || [ "$NEW_PORT" -gt 65535 ]; then
+        echo -e "${RED}Port khong hop le (phai la so tu 1-65535).${NC}"
+        return
+    fi
+    if [ "$NEW_PORT" = "$SSL_PORT" ]; then
+        echo -e "${YELLOW}Port moi giong port hien tai, khong co gi de doi.${NC}"
+        return
+    fi
+    if ss -Htln "( sport = :$NEW_PORT )" 2>/dev/null | grep -q .; then
+        echo -e "${RED}Port $NEW_PORT dang bi service khac chiem dung tren may nay. Chon port khac.${NC}"
+        return
+    fi
+
+    local NGINX_CONF="/etc/nginx/sites-available/mtunnel"
+    if [ ! -f "$NGINX_CONF" ]; then
+        echo -e "${RED}Khong tim thay $NGINX_CONF — khong the doi port tu dong.${NC}"
+        return
+    fi
+
+    cp "$NGINX_CONF" "$NGINX_CONF.bak_before_port_change"
+    sed -i "s/listen $SSL_PORT ssl;/listen $NEW_PORT ssl;/; s/listen \[::\]:$SSL_PORT ssl;/listen [::]:$NEW_PORT ssl;/" "$NGINX_CONF"
+
+    if nginx -t 2>/tmp/nginx-port-test.log; then
+        systemctl reload nginx
+        if command -v ufw > /dev/null 2>&1 && ufw status | grep -q "Status: active"; then
+            ufw allow "$NEW_PORT"/tcp > /dev/null 2>&1
+            read -p "Dong port cu ($SSL_PORT) tren ufw luon khong? [y/N]: " CLOSE_OLD
+            if [[ "$CLOSE_OLD" == "y" || "$CLOSE_OLD" == "Y" ]]; then
+                ufw delete allow "$SSL_PORT"/tcp > /dev/null 2>&1
+                echo -e "${YELLOW}Da dong port $SSL_PORT tren ufw.${NC}"
+            fi
+        fi
+        # Cap nhat .config de menu doc lai dung port cac lan sau
+        if grep -q "^SSL_PORT=" "$CONFIG_FILE" 2>/dev/null; then
+            sed -i "s/^SSL_PORT=.*/SSL_PORT=$NEW_PORT/" "$CONFIG_FILE"
+        else
+            echo "SSL_PORT=$NEW_PORT" >> "$CONFIG_FILE"
+        fi
+        OLD_PORT="$SSL_PORT"
+        SSL_PORT="$NEW_PORT"
+        rm -f "$NGINX_CONF.bak_before_port_change"
+        echo -e "${GREEN}✅ Da doi port tu $OLD_PORT sang $NEW_PORT.${NC}"
+        echo -e "${YELLOW}Nho cap nhat lai domain:port trong config app Android — client se khong ket noi duoc neu con tro port cu.${NC}"
+    else
+        cp "$NGINX_CONF.bak_before_port_change" "$NGINX_CONF"
+        rm -f "$NGINX_CONF.bak_before_port_change"
+        echo -e "${RED}Nginx config loi, da rollback ve port cu. Chi tiet:${NC}"
+        cat /tmp/nginx-port-test.log
+    fi
+}
+
 while true; do
     show_header
     echo -e "${CYAN}Chon thao tac:${NC}"
@@ -1209,9 +1270,10 @@ while true; do
     echo "  7) Quan ly Signing Key (Export/Import giua cac VPS)"
     echo "  8) Quan ly Attestation Whitelist (cho phep may root hoat dong)"
     echo "  9) Quan ly Signing Hash Allow-list (Key Attestation - chong resign/inject APK)"
-    echo "  10) Thoat"
+    echo "  10) Doi port HTTPS"
+    echo "  11) Thoat"
     echo ""
-    read -p "Nhap lua chon [1-10]: " CHOICE
+    read -p "Nhap lua chon [1-11]: " CHOICE
     echo ""
 
     case "$CHOICE" in
@@ -1274,6 +1336,9 @@ while true; do
             signing_hash_menu
             ;;
         10)
+            change_port_menu
+            ;;
+        11)
             echo "Tam biet."
             exit 0
             ;;
