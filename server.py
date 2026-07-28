@@ -40,6 +40,13 @@ GITHUB_TOKEN_FILE = os.path.join(INSTALL_DIR, ".github_token")
 GITHUB_REPO_FILE  = os.path.join(INSTALL_DIR, ".github_repo")
 DEX_HASHES_FILE   = os.path.join(INSTALL_DIR, ".dex_hashes.json")
 DEVICE_BLOCKED_FILE = os.path.join(INSTALL_DIR, ".attestation_blocked_devices.json")
+# Whitelist SHA-256 (hex) của chữ ký ký APK thật (bản build gốc, có thể có
+# nhiều giá trị khi đang rollout key mới) — xem compute_signing_hash.py.
+# Đây là "nguồn sự thật" độc lập với _check_auth()/token, vì giá trị được
+# đối chiếu lấy từ TRONG chain attestation phần cứng (AttestationApplicationId,
+# tag 709), do system_server/Keystore điền, KHÔNG đi qua tiến trình app nên
+# không bị xhook/"Kill Signature Verification" (MT Manager) đánh lừa được.
+ATTESTATION_SIGNING_HASHES_FILE = os.path.join(INSTALL_DIR, ".attestation_signing_hashes.json")
 
 
 CACHE_TTL        = 3600
@@ -307,6 +314,20 @@ def _load_dex_hashes():
     except:
         return []
 
+def _load_allowed_signing_hashes():
+    """
+    File .attestation_signing_hashes.json:
+      {"allowed": ["<sha256 hex chu ky APK that>", ...]}
+    Tinh bang compute_signing_hash.py tren APK build goc (SHA-256 cua DER
+    bytes cua signing certificate — cung thuat toan Android dung de dien
+    signatureDigests trong AttestationApplicationId).
+    """
+    try:
+        with open(ATTESTATION_SIGNING_HASHES_FILE, "r") as f:
+            return set(h.lower() for h in json.load(f).get("allowed", []))
+    except:
+        return set()
+
 def _dex_nonce_cleanup():
     now = time.time()
     with _dex_nonce_lock:
@@ -426,6 +447,15 @@ def _get_google_attestation_roots():
 
 KEY_DESCRIPTION_OID = "1.3.6.1.4.1.11129.2.1.17"
 ROOT_OF_TRUST_TAG   = 704   # context tag [704] EXPLICIT trong AuthorizationList
+ATTESTATION_APPLICATION_ID_TAG = 709   # context tag [709] EXPLICIT OCTET STRING
+                                        # chua DER-encoded AttestationApplicationId:
+                                        #   SEQUENCE {
+                                        #     packageInfoRecords SET OF SEQUENCE { packageName OCTET STRING, version INTEGER },
+                                        #     signatureDigests   SET OF OCTET STRING (SHA-256 cua tung cert ky)
+                                        #   }
+                                        # Do KEYSTORE/system_server dien vao luc tao key — KHONG di qua
+                                        # tien trinh app, nen khong bi xhook/"Kill Signature Verification"
+                                        # (vd MT Manager) danh lua duoc, khac voi getPass123()/token client tu bao cao.
 
 
 class AttestationParseError(Exception):
@@ -511,8 +541,13 @@ def _parse_key_attestation_extension(leaf_cert):
         raise AttestationParseError("key_description_thieu_truong")
 
     attestation_challenge = top_items[4][3]
+    software_enforced_content = top_items[6][3]
     tee_enforced_content = top_items[7][3]
     tee_items = _der_read_sequence_items(tee_enforced_content)
+
+    package_names, signature_digests_hex = _parse_attestation_application_id(
+        software_enforced_content, tee_enforced_content
+    )
 
     root_of_trust_content = None
     for tag, tag_class, constructed, content in tee_items:
@@ -538,7 +573,60 @@ def _parse_key_attestation_extension(leaf_cert):
         "attestation_challenge": attestation_challenge,
         "device_locked": device_locked_bytes != b"\x00",
         "verified_boot_state": int.from_bytes(verified_boot_state_bytes, "big"),
+        "package_names": package_names,
+        "signature_digests_hex": signature_digests_hex,
     }
+
+
+def _find_context_tag(items, tag_number):
+    """Tim item co context-specific tag == tag_number trong list (tag, class, constructed, content)."""
+    for tag, tag_class, constructed, content in items:
+        if tag_class == 2 and tag == tag_number:
+            return content
+    return None
+
+
+def _parse_attestation_application_id(software_enforced_content: bytes, tee_enforced_content: bytes):
+    """
+    Doc AttestationApplicationId (tag 709) tu AuthorizationList. Tag nay
+    THUONG nam trong softwareEnforced (Keystore dien o tang software khi
+    tao key), nhung 1 so thiet bi/OEM dat trong teeEnforced — nen kiem tra
+    ca hai, khong hardcode 1 cho.
+
+    Tra ve (package_names: list[str], signature_digests_hex: list[str]).
+    Raise AttestationParseError neu khong tim thay o ca hai noi.
+    """
+    software_items = _der_read_sequence_items(software_enforced_content)
+    tee_items = _der_read_sequence_items(tee_enforced_content)
+
+    raw_709 = _find_context_tag(software_items, ATTESTATION_APPLICATION_ID_TAG)
+    if raw_709 is None:
+        raw_709 = _find_context_tag(tee_items, ATTESTATION_APPLICATION_ID_TAG)
+    if raw_709 is None:
+        raise AttestationParseError("khong_tim_thay_attestation_application_id")
+
+    # [709] EXPLICIT OCTET STRING -> boc 1 lop de lay noi dung OCTET STRING,
+    # noi dung do chinh la DER bytes cua SEQUENCE AttestationApplicationId.
+    _, _, _, octet_content, _ = _der_read_tlv(raw_709, 0)
+    _, _, _, aaid_seq_content, _ = _der_read_tlv(octet_content, 0)
+    aaid_items = _der_read_sequence_items(aaid_seq_content)
+    if len(aaid_items) < 2:
+        raise AttestationParseError("attestation_application_id_thieu_truong")
+
+    package_info_set_content = aaid_items[0][3]
+    signature_digest_set_content = aaid_items[1][3]
+
+    package_names = []
+    for _, _, _, pkg_info_content in _der_read_sequence_items(package_info_set_content):
+        pkg_info_items = _der_read_sequence_items(pkg_info_content)
+        if pkg_info_items:
+            package_names.append(pkg_info_items[0][3].decode("utf-8", errors="replace"))
+
+    signature_digests_hex = [
+        content.hex() for _, _, _, content in _der_read_sequence_items(signature_digest_set_content)
+    ]
+
+    return package_names, signature_digests_hex
 
 
 def _verify_cert_signed_by(child_cert, parent_pubkey):
@@ -705,7 +793,44 @@ def attestation_verify():
     # verifiedBootState 0 = Verified (bootloader khoá, ROM gốc nhà sản xuất).
     # deviceLocked = true nghĩa là bootloader đang ở trạng thái khoá tại
     # thời điểm tạo khoá này.
-    is_valid = (parsed["verified_boot_state"] == 0) and parsed["device_locked"]
+    #
+    # QUAN TRỌNG: 2 điều kiện trên chỉ chứng minh "máy sạch" (TEE thật,
+    # chưa root, bootloader khoá) — KHÔNG chứng minh app nào đã yêu cầu key.
+    # Một APK bị inject/ký lại (vd qua MT Manager "Kill Signature
+    # Verification" + libSignatureKiller.so hook PackageManager trong tiến
+    # trình app) vẫn tạo ra chain attestation hợp lệ 100% về mặt phần cứng
+    # trên 1 máy zin không root, vì `pkg`/`token` gửi kèm request body là
+    # dữ liệu client tự khai — không liên quan gì tới nội dung chain đã ký.
+    #
+    # Muốn chặn đúng trường hợp đó, PHẢI đối chiếu package name + hash chữ
+    # ký lấy TỪ TRONG chain (AttestationApplicationId, tag 709) — trường
+    # này do Keystore/system_server điền lúc tạo key, không đi qua tiến
+    # trình app nên hook kiểu xhook không với tới được.
+    valid_package = _get_package()
+    allowed_sig_hashes = _load_allowed_signing_hashes()
+
+    package_ok = bool(valid_package) and (valid_package in parsed["package_names"])
+    sig_ok = bool(allowed_sig_hashes) and any(
+        h in allowed_sig_hashes for h in parsed["signature_digests_hex"]
+    )
+    identity_ok = package_ok and sig_ok
+
+    if not package_ok:
+        app.logger.warning(
+            f"[attestation-verify] REJECT {ip}: package_mismatch | "
+            f"expected={valid_package} | got={parsed['package_names']}"
+        )
+    if not sig_ok:
+        app.logger.warning(
+            f"[attestation-verify] REJECT {ip}: signing_hash_mismatch | "
+            f"got={parsed['signature_digests_hex']}"
+        )
+
+    is_valid = (
+        (parsed["verified_boot_state"] == 0)
+        and parsed["device_locked"]
+        and identity_ok
+    )
 
     result_payload = {
         "valid": is_valid,

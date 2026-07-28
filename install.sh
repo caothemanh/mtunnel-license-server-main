@@ -287,6 +287,7 @@ TOKEN_FILE="$INSTALL_DIR/.token"
 CONFIG_FILE="$INSTALL_DIR/.config"
 SIGNING_KEY_FILE="$INSTALL_DIR/.signing_key"
 DEX_HASHES_FILE="$INSTALL_DIR/.dex_hashes.json"
+ATTESTATION_SIGNING_HASHES_FILE="$INSTALL_DIR/.attestation_signing_hashes.json"
 DEVICE_WHITELIST_FILE="$INSTALL_DIR/.attestation_whitelist.json"
 DEVICE_BLOCKED_FILE="$INSTALL_DIR/.attestation_blocked_devices.json"
 APK_UPLOAD_DIR="$INSTALL_DIR/apk_uploads"
@@ -517,7 +518,313 @@ print(f"COUNT:{len(removed)}")
 PYEOF
 }
 
+# Lay SHA-256 cua signing certificate TRUC TIEP tu file APK (khong can
+# apksigner/keytool). Uu tien doc tu APK Signing Block v2/v3 (pure Python,
+# tu parse dinh dang - xem source.android.com/docs/security/apksigning/v2)
+# vi day la thu duy nhat luon co tren APK build boi Android Gradle Plugin
+# hien dai; fallback doc PKCS7 trong META-INF/*.RSA|DSA|EC (v1 JAR signing)
+# neu APK chi con giu v1. Gia tri tra ve KHOP CHINH XAC voi truong
+# "signatureDigests" ma Android tu dien vao AttestationApplicationId (tag
+# 709) trong chain Key Attestation — day cung la gia tri server doi chieu
+# trong attestation_verify() (server.py).
+compute_signing_hash() {
+    local apk_path="$1"
+    python3 - "$apk_path" << 'PYEOF'
+import sys, struct, zipfile, hashlib, re
+
+apk_path = sys.argv[1]
+
+def find_eocd(data):
+    idx = data.rfind(b'PK\x05\x06')
+    if idx == -1:
+        raise ValueError("khong_tim_thay_eocd")
+    return idx
+
+def central_dir_offset(data):
+    eocd = find_eocd(data)
+    return struct.unpack_from('<I', data, eocd + 16)[0]
+
+def read_lp(buf, off):
+    length = struct.unpack_from('<I', buf, off)[0]
+    start = off + 4
+    end = start + length
+    return buf[start:end], end
+
+def iter_lp_items(buf):
+    off = 0
+    while off < len(buf):
+        item, off = read_lp(buf, off)
+        yield item
+
+def certs_from_v2v3(data):
+    cd_offset = central_dir_offset(data)
+    trailer = data[cd_offset - 24:cd_offset]
+    size_trailer, magic = struct.unpack('<Q16s', trailer)
+    if magic != b'APK Sig Block 42':
+        return []
+    block_start = cd_offset - size_trailer - 8
+    pairs = data[block_start + 8: cd_offset - 24]
+    out = []
+    off = 0
+    while off < len(pairs):
+        length = struct.unpack_from('<Q', pairs, off)[0]
+        off += 8
+        entry = pairs[off:off + length]
+        id_ = struct.unpack_from('<I', entry, 0)[0]
+        value = entry[4:]
+        off += length
+        if id_ not in (0x7109871a, 0xf05368c0, 0x1b93ad61):  # v2, v3, v3.1
+            continue
+        signer_seq, _ = read_lp(value, 0)
+        for signer in iter_lp_items(signer_seq):
+            signed_data, _ = read_lp(signer, 0)
+            _, off_sd = read_lp(signed_data, 0)          # digests (bo qua)
+            certs_seq, _ = read_lp(signed_data, off_sd)
+            for c in iter_lp_items(certs_seq):
+                out.append(c)
+    return out
+
+def certs_from_v1(data):
+    with zipfile.ZipFile.__new__(zipfile.ZipFile) as _:
+        pass
+    import io
+    z = zipfile.ZipFile(io.BytesIO(data))
+    sig_re = re.compile(r"^META-INF/[^/]+\.(RSA|DSA|EC)$", re.IGNORECASE)
+    sig_files = [n for n in z.namelist() if sig_re.match(n)]
+    if not sig_files:
+        return []
+    from cryptography.hazmat.primitives.serialization import pkcs7, Encoding
+    certs = pkcs7.load_der_pkcs7_certificates(z.read(sig_files[0]))
+    return [c.public_bytes(Encoding.DER) for c in certs]
+
+try:
+    with open(apk_path, 'rb') as f:
+        data = f.read()
+
+    certs = certs_from_v2v3(data)
+    source = "v2/v3"
+    if not certs:
+        certs = certs_from_v1(data)
+        source = "v1 (META-INF)"
+    if not certs:
+        print("ERROR:khong_tim_thay_signing_certificate_nao", file=sys.stderr)
+        sys.exit(1)
+
+    digest = hashlib.sha256(certs[0]).hexdigest()
+    print(f"  Nguon: {source} | so cert: {len(certs)} | cert[0] len={len(certs[0])} bytes", file=sys.stderr)
+    print(digest)
+except Exception as e:
+    print(f"ERROR:{e}", file=sys.stderr)
+    sys.exit(1)
+PYEOF
+}
+
+list_signing_hashes() {
+    python3 - "$ATTESTATION_SIGNING_HASHES_FILE" << 'PYEOF'
+import sys, json
+try:
+    with open(sys.argv[1]) as f:
+        allowed = json.load(f).get("allowed", [])
+except Exception:
+    allowed = []
+if not allowed:
+    print("(chua co hash nao trong allow-list)")
+else:
+    for i, h in enumerate(allowed, 1):
+        print(f"  {i}) {h}")
+PYEOF
+}
+
+add_signing_hash() {
+    local hash_hex="$1"
+    python3 - "$ATTESTATION_SIGNING_HASHES_FILE" "$hash_hex" << 'PYEOF'
+import sys, json, os
+path, new_hash = sys.argv[1], sys.argv[2]
+try:
+    with open(path) as f:
+        doc = json.load(f)
+except Exception:
+    doc = {"allowed": []}
+allowed = doc.setdefault("allowed", [])
+if new_hash in allowed:
+    print("DUPLICATE")
+else:
+    allowed.append(new_hash)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(doc, f, indent=2)
+    os.replace(tmp, path)
+    print("ADDED")
+PYEOF
+}
+
+preview_signing_hash_selection() {
+    local idx_csv="$1"
+    python3 - "$ATTESTATION_SIGNING_HASHES_FILE" "$idx_csv" << 'PYEOF'
+import sys, json
+path, idx_csv = sys.argv[1], sys.argv[2]
+try:
+    with open(path) as f:
+        allowed = json.load(f).get("allowed", [])
+except Exception:
+    allowed = []
+if not allowed:
+    print("ERROR:empty")
+    sys.exit(1)
+if idx_csv.strip().lower() == "all":
+    selected = set(range(1, len(allowed) + 1))
+else:
+    selected = set()
+    for part in idx_csv.replace(" ", ",").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if not part.isdigit():
+            print(f"ERROR:invalid_index:{part}")
+            sys.exit(1)
+        selected.add(int(part))
+invalid = [i for i in selected if i < 1 or i > len(allowed)]
+if invalid:
+    print(f"ERROR:invalid_index:{','.join(map(str, sorted(invalid)))}")
+    sys.exit(1)
+if not selected:
+    print("ERROR:no_selection")
+    sys.exit(1)
+for i, h in enumerate(allowed, 1):
+    mark = "[x]" if i in selected else "[ ]"
+    print(f"{mark} {i}) {h}")
+print(f"COUNT:{len(selected)}")
+PYEOF
+}
+
+remove_signing_hashes_by_indices() {
+    local idx_csv="$1"
+    python3 - "$ATTESTATION_SIGNING_HASHES_FILE" "$idx_csv" << 'PYEOF'
+import sys, json, os
+path, idx_csv = sys.argv[1], sys.argv[2]
+try:
+    with open(path) as f:
+        doc = json.load(f)
+except Exception:
+    print("ERROR:file_not_found")
+    sys.exit(1)
+allowed = doc.get("allowed", [])
+if idx_csv.strip().lower() == "all":
+    indices = set(range(1, len(allowed) + 1))
+else:
+    indices = set()
+    for part in idx_csv.replace(" ", ",").split(","):
+        part = part.strip()
+        if part:
+            indices.add(int(part))
+invalid = [i for i in indices if i < 1 or i > len(allowed)]
+if invalid:
+    print(f"ERROR:invalid_index:{','.join(map(str, sorted(invalid)))}")
+    sys.exit(1)
+if not indices:
+    print("ERROR:no_selection")
+    sys.exit(1)
+removed = []
+for i in sorted(indices, reverse=True):
+    removed.append(allowed.pop(i - 1))
+removed.reverse()
+tmp = path + ".tmp"
+with open(tmp, "w") as f:
+    json.dump(doc, f, indent=2)
+os.replace(tmp, path)
+print("REMOVED:" + "|".join(removed))
+print(f"COUNT:{len(removed)}")
+PYEOF
+}
+
+signing_hash_menu() {
+    while true; do
+        echo -e "${CYAN}${BOLD}--- Quan ly Signing Hash Allow-list (/api/attestation-verify) ---${NC}"
+        echo ""
+        echo -e "${YELLOW}Hash nay doi chieu voi AttestationApplicationId trong chain Key${NC}"
+        echo -e "${YELLOW}Attestation phan cung — khong the gia mao bang hook/resign APK.${NC}"
+        echo ""
+        echo "  1) Them hash tu file APK (chon theo so, khong go duong dan)"
+        echo "  2) Xem danh sach hash dang duoc phep"
+        echo "  3) Xoa 1 hash khoi allow-list"
+        echo "  4) Quay lai"
+        echo ""
+        read -p "Chon [1-4]: " SH_CHOICE
+        echo ""
+        case "$SH_CHOICE" in
+            1)
+                if ! pick_apk_file; then
+                    :
+                else
+                    echo ""
+                    echo -e "${YELLOW}Dang doc signing certificate tu: $(basename "$SELECTED_APK")...${NC}"
+                    echo ""
+                    OUTPUT=$(compute_signing_hash "$SELECTED_APK")
+                    SIG_HASH=$(echo "$OUTPUT" | tail -1)
+                    if [[ "$SIG_HASH" == ERROR:* ]]; then
+                        echo -e "${RED}That bai: $SIG_HASH${NC}"
+                    else
+                        echo "$OUTPUT" | head -n -1
+                        echo -e "${GREEN}SHA-256 chu ky: ${BOLD}$SIG_HASH${NC}"
+                        echo ""
+                        read -p "Them hash nay vao allow-list? [y/N]: " SH_CONFIRM
+                        if [[ "$SH_CONFIRM" == "y" || "$SH_CONFIRM" == "Y" ]]; then
+                            SH_RESULT=$(add_signing_hash "$SIG_HASH")
+                            chmod 600 "$ATTESTATION_SIGNING_HASHES_FILE" 2>/dev/null || true
+                            chown www-data:www-data "$ATTESTATION_SIGNING_HASHES_FILE" 2>/dev/null || true
+                            if [ "$SH_RESULT" == "ADDED" ]; then
+                                echo -e "${GREEN}✅ Da them vao allow-list (khong can restart service).${NC}"
+                            else
+                                echo -e "${YELLOW}Hash nay da co san trong allow-list roi.${NC}"
+                            fi
+                        else
+                            echo -e "${YELLOW}Da huy.${NC}"
+                        fi
+                    fi
+                fi
+                ;;
+            2)
+                list_signing_hashes
+                ;;
+            3)
+                list_signing_hashes
+                echo ""
+                echo -e "${YELLOW}Nhap cac so muon xoa, cach nhau boi dau phay hoac khoang trang (vd: 1,3,5).${NC}"
+                echo -e "${YELLOW}Go 'all' de xoa tat ca. Enter de huy.${NC}"
+                read -p "Chon: " SH_IDX
+                if [ -n "$SH_IDX" ]; then
+                    SH_PREVIEW=$(preview_signing_hash_selection "$SH_IDX")
+                    if [[ "$SH_PREVIEW" == ERROR:empty* ]]; then
+                        echo -e "${RED}Danh sach dang trong.${NC}"
+                    elif [[ "$SH_PREVIEW" == ERROR:invalid_index* ]]; then
+                        echo -e "${RED}So thu tu khong hop le: ${SH_PREVIEW#ERROR:invalid_index:}${NC}"
+                    elif [[ "$SH_PREVIEW" == ERROR:no_selection* ]]; then
+                        echo -e "${RED}Chua chon muc nao.${NC}"
+                    else
+                        echo "$SH_PREVIEW"
+                        echo ""
+                        read -p "Xac nhan xoa cac muc tren? [y/N]: " SH_DEL_CONFIRM
+                        if [[ "$SH_DEL_CONFIRM" == "y" || "$SH_DEL_CONFIRM" == "Y" ]]; then
+                            SH_DEL_RESULT=$(remove_signing_hashes_by_indices "$SH_IDX")
+                            chmod 600 "$ATTESTATION_SIGNING_HASHES_FILE" 2>/dev/null || true
+                            chown www-data:www-data "$ATTESTATION_SIGNING_HASHES_FILE" 2>/dev/null || true
+                            COUNT=$(echo "$SH_DEL_RESULT" | grep -o 'COUNT:[0-9]*' | cut -d: -f2)
+                            echo -e "${GREEN}✅ Da xoa $COUNT hash.${NC}"
+                        else
+                            echo -e "${YELLOW}Da huy.${NC}"
+                        fi
+                    fi
+                fi
+                ;;
+            4) return ;;
+            *) echo -e "${RED}Lua chon khong hop le.${NC}" ;;
+        esac
+        pause
+    done
+}
+
 dex_hash_menu() {
+
     while true; do
         echo -e "${CYAN}${BOLD}--- Quan ly DEX Hash Allow-list (/api/dex-verify) ---${NC}"
         echo ""
@@ -1135,9 +1442,10 @@ while true; do
     echo "  7) Quan ly Signing Key (Export/Import giua cac VPS)"
     echo "  8) Quan ly DEX Hash Allow-list (/api/dex-verify)"
     echo "  9) Quan ly Attestation Whitelist (cho phep may root hoat dong)"
-    echo "  10) Thoat"
+    echo "  10) Quan ly Signing Hash Allow-list (Key Attestation - chong resign/inject APK)"
+    echo "  11) Thoat"
     echo ""
-    read -p "Nhap lua chon [1-10]: " CHOICE
+    read -p "Nhap lua chon [1-11]: " CHOICE
     echo ""
 
     case "$CHOICE" in
@@ -1200,6 +1508,9 @@ while true; do
             attestation_whitelist_menu
             ;;
         10)
+            signing_hash_menu
+            ;;
+        11)
             echo "Tam biet."
             exit 0
             ;;
