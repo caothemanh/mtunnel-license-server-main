@@ -286,7 +286,6 @@ INSTALL_DIR="/opt/mtunnel"
 TOKEN_FILE="$INSTALL_DIR/.token"
 CONFIG_FILE="$INSTALL_DIR/.config"
 SIGNING_KEY_FILE="$INSTALL_DIR/.signing_key"
-DEX_HASHES_FILE="$INSTALL_DIR/.dex_hashes.json"
 ATTESTATION_SIGNING_HASHES_FILE="$INSTALL_DIR/.attestation_signing_hashes.json"
 DEVICE_WHITELIST_FILE="$INSTALL_DIR/.attestation_whitelist.json"
 DEVICE_BLOCKED_FILE="$INSTALL_DIR/.attestation_blocked_devices.json"
@@ -345,31 +344,6 @@ show_header() {
     echo ""
 }
 
-compute_dex_hash() {
-    local apk_path="$1"
-    python3 - "$apk_path" << 'PYEOF'
-import sys, zipfile, hashlib, re
-apk_path = sys.argv[1]
-DEX_RE = re.compile(r"^classes\d*\.dex$")
-try:
-    with zipfile.ZipFile(apk_path, "r") as z:
-        entries = sorted(n for n in z.namelist() if DEX_RE.match(n))
-        if not entries:
-            print("ERROR:no_dex_entries_found", file=sys.stderr)
-            sys.exit(1)
-        digests = b""
-        for name in entries:
-            data = z.read(name)
-            h = hashlib.sha256(data).digest()
-            digests += h
-            print(f"  {name}: {h.hex()} ({len(data)} bytes)", file=sys.stderr)
-        print(hashlib.sha256(digests).hexdigest())
-except Exception as e:
-    print(f"ERROR:{e}", file=sys.stderr)
-    sys.exit(1)
-PYEOF
-}
-
 pick_apk_file() {
     SELECTED_APK=""
     mapfile -t APK_FILES < <(find "$APK_UPLOAD_DIR" -maxdepth 1 -type f -iname "*.apk" 2>/dev/null | sort)
@@ -398,124 +372,6 @@ pick_apk_file() {
     fi
     SELECTED_APK="${APK_FILES[$((PICK - 1))]}"
     return 0
-}
-
-list_dex_hashes() {
-    python3 - "$DEX_HASHES_FILE" << 'PYEOF'
-import sys, json
-try:
-    with open(sys.argv[1]) as f:
-        allowed = json.load(f).get("allowed", [])
-except Exception:
-    allowed = []
-if not allowed:
-    print("(chua co hash nao trong allow-list)")
-else:
-    for i, h in enumerate(allowed, 1):
-        print(f"  {i}) {h}")
-PYEOF
-}
-
-add_dex_hash() {
-    local hash_hex="$1"
-    python3 - "$DEX_HASHES_FILE" "$hash_hex" << 'PYEOF'
-import sys, json, os
-path, new_hash = sys.argv[1], sys.argv[2]
-try:
-    with open(path) as f:
-        doc = json.load(f)
-except Exception:
-    doc = {"allowed": []}
-allowed = doc.setdefault("allowed", [])
-if new_hash in allowed:
-    print("DUPLICATE")
-else:
-    allowed.append(new_hash)
-    tmp = path + ".tmp"
-    with open(tmp, "w") as f:
-        json.dump(doc, f, indent=2)
-    os.replace(tmp, path)
-    print("ADDED")
-PYEOF
-}
-
-preview_dex_hash_selection() {
-    local idx_csv="$1"
-    python3 - "$DEX_HASHES_FILE" "$idx_csv" << 'PYEOF'
-import sys, json
-path, idx_csv = sys.argv[1], sys.argv[2]
-try:
-    with open(path) as f:
-        allowed = json.load(f).get("allowed", [])
-except Exception:
-    allowed = []
-if not allowed:
-    print("ERROR:empty")
-    sys.exit(1)
-if idx_csv.strip().lower() == "all":
-    selected = set(range(1, len(allowed) + 1))
-else:
-    selected = set()
-    for part in idx_csv.replace(" ", ",").split(","):
-        part = part.strip()
-        if not part:
-            continue
-        if not part.isdigit():
-            print(f"ERROR:invalid_index:{part}")
-            sys.exit(1)
-        selected.add(int(part))
-invalid = [i for i in selected if i < 1 or i > len(allowed)]
-if invalid:
-    print(f"ERROR:invalid_index:{','.join(map(str, sorted(invalid)))}")
-    sys.exit(1)
-if not selected:
-    print("ERROR:no_selection")
-    sys.exit(1)
-for i, h in enumerate(allowed, 1):
-    mark = "[x]" if i in selected else "[ ]"
-    print(f"{mark} {i}) {h}")
-print(f"COUNT:{len(selected)}")
-PYEOF
-}
-
-remove_dex_hashes_by_indices() {
-    local idx_csv="$1"
-    python3 - "$DEX_HASHES_FILE" "$idx_csv" << 'PYEOF'
-import sys, json, os
-path, idx_csv = sys.argv[1], sys.argv[2]
-try:
-    with open(path) as f:
-        doc = json.load(f)
-except Exception:
-    print("ERROR:file_not_found")
-    sys.exit(1)
-allowed = doc.get("allowed", [])
-if idx_csv.strip().lower() == "all":
-    indices = set(range(1, len(allowed) + 1))
-else:
-    indices = set()
-    for part in idx_csv.replace(" ", ",").split(","):
-        part = part.strip()
-        if part:
-            indices.add(int(part))
-invalid = [i for i in indices if i < 1 or i > len(allowed)]
-if invalid:
-    print(f"ERROR:invalid_index:{','.join(map(str, sorted(invalid)))}")
-    sys.exit(1)
-if not indices:
-    print("ERROR:no_selection")
-    sys.exit(1)
-removed = []
-for i in sorted(indices, reverse=True):
-    removed.append(allowed.pop(i - 1))
-removed.reverse()
-tmp = path + ".tmp"
-with open(tmp, "w") as f:
-    json.dump(doc, f, indent=2)
-os.replace(tmp, path)
-print("REMOVED:" + "|".join(removed))
-print(f"COUNT:{len(removed)}")
-PYEOF
 }
 
 # Lay SHA-256 cua signing certificate TRUC TIEP tu file APK (khong can
@@ -820,99 +676,6 @@ signing_hash_menu() {
             *) echo -e "${RED}Lua chon khong hop le.${NC}" ;;
         esac
         pause
-    done
-}
-
-dex_hash_menu() {
-
-    while true; do
-        echo -e "${CYAN}${BOLD}--- Quan ly DEX Hash Allow-list (/api/dex-verify) ---${NC}"
-        echo ""
-        echo "  1) Them hash tu file APK (chon theo so, khong go duong dan)"
-        echo "  2) Xem danh sach hash dang duoc phep"
-        echo "  3) Xoa 1 hash khoi allow-list"
-        echo "  4) Quay lai"
-        echo ""
-        read -p "Chon [1-4]: " DH_CHOICE
-        echo ""
-        case "$DH_CHOICE" in
-            1)
-                if ! pick_apk_file; then
-                    :
-                else
-                    echo ""
-                    echo -e "${YELLOW}Dang tinh hash cho: $(basename "$SELECTED_APK")...${NC}"
-                    echo ""
-                    OUTPUT=$(compute_dex_hash "$SELECTED_APK")
-                    COMBINED=$(echo "$OUTPUT" | tail -1)
-                    if [[ "$COMBINED" == ERROR:* ]]; then
-                        echo -e "${RED}That bai: $COMBINED${NC}"
-                    else
-                        echo -e "${GREEN}Combined SHA-256: ${BOLD}$COMBINED${NC}"
-                        echo ""
-                        read -p "Them hash nay vao allow-list? [y/N]: " DH_CONFIRM
-                        if [[ "$DH_CONFIRM" == "y" || "$DH_CONFIRM" == "Y" ]]; then
-                            DH_RESULT=$(add_dex_hash "$COMBINED")
-                            chmod 600 "$DEX_HASHES_FILE" 2>/dev/null || true
-                            chown www-data:www-data "$DEX_HASHES_FILE" 2>/dev/null || true
-                            if [ "$DH_RESULT" == "ADDED" ]; then
-                                echo -e "${GREEN}✅ Da them vao allow-list (khong can restart service).${NC}"
-                            else
-                                echo -e "${YELLOW}Hash nay da co san trong allow-list roi.${NC}"
-                            fi
-                        else
-                            echo -e "${YELLOW}Da huy.${NC}"
-                        fi
-                    fi
-                fi
-                ;;
-            2)
-                list_dex_hashes
-                ;;
-            3)
-                list_dex_hashes
-                echo ""
-                echo -e "${YELLOW}Nhap cac so muon xoa, cach nhau boi dau phay hoac khoang trang (vd: 1,3,5).${NC}"
-                echo -e "${YELLOW}Go 'all' de xoa tat ca. Enter de huy.${NC}"
-                read -p "Chon: " DH_IDX
-                if [ -n "$DH_IDX" ]; then
-                    DH_PREVIEW=$(preview_dex_hash_selection "$DH_IDX")
-                    if [[ "$DH_PREVIEW" == ERROR:empty* ]]; then
-                        echo -e "${RED}Danh sach dang trong.${NC}"
-                    elif [[ "$DH_PREVIEW" == ERROR:invalid_index* ]]; then
-                        echo -e "${RED}So thu tu khong hop le: ${DH_PREVIEW#ERROR:invalid_index:}${NC}"
-                    elif [[ "$DH_PREVIEW" == ERROR:no_selection* ]]; then
-                        echo -e "${RED}Chua chon muc nao.${NC}"
-                    else
-                        echo ""
-                        echo -e "${CYAN}${BOLD}Danh sach da chon xoa:${NC}"
-                        echo "$DH_PREVIEW" | grep -v "^COUNT:"
-                        DH_SEL_COUNT=$(echo "$DH_PREVIEW" | grep "^COUNT:" | cut -d: -f2)
-                        echo ""
-                        read -p "Xac nhan xoa $DH_SEL_COUNT hash da chon? [y/N]: " DH_CONFIRM
-                        if [[ "$DH_CONFIRM" == "y" || "$DH_CONFIRM" == "Y" ]]; then
-                            DH_RESULT=$(remove_dex_hashes_by_indices "$DH_IDX")
-                            if [[ "$DH_RESULT" == *"REMOVED:"* ]]; then
-                                DH_RM_COUNT=$(echo "$DH_RESULT" | grep "^COUNT:" | cut -d: -f2)
-                                echo -e "${GREEN}✅ Da xoa $DH_RM_COUNT hash.${NC}"
-                                echo -e "${RED}App nao dang chay dung cac hash nay se bi kill trong lan check ke tiep.${NC}"
-                            else
-                                echo -e "${RED}Loi: $DH_RESULT${NC}"
-                            fi
-                        else
-                            echo -e "${YELLOW}Da huy.${NC}"
-                        fi
-                    fi
-                fi
-                ;;
-            4)
-                return
-                ;;
-            *)
-                echo -e "${RED}Lua chon khong hop le.${NC}"
-                ;;
-        esac
-        echo ""
     done
 }
 
@@ -1440,12 +1203,11 @@ while true; do
     echo "  5) Xem log realtime (Ctrl+C de quay lai menu)"
     echo "  6) Restart service"
     echo "  7) Quan ly Signing Key (Export/Import giua cac VPS)"
-    echo "  8) Quan ly DEX Hash Allow-list (/api/dex-verify)"
-    echo "  9) Quan ly Attestation Whitelist (cho phep may root hoat dong)"
-    echo "  10) Quan ly Signing Hash Allow-list (Key Attestation - chong resign/inject APK)"
-    echo "  11) Thoat"
+    echo "  8) Quan ly Attestation Whitelist (cho phep may root hoat dong)"
+    echo "  9) Quan ly Signing Hash Allow-list (Key Attestation - chong resign/inject APK)"
+    echo "  10) Thoat"
     echo ""
-    read -p "Nhap lua chon [1-11]: " CHOICE
+    read -p "Nhap lua chon [1-10]: " CHOICE
     echo ""
 
     case "$CHOICE" in
@@ -1502,15 +1264,12 @@ while true; do
             signing_key_menu
             ;;
         8)
-            dex_hash_menu
-            ;;
-        9)
             attestation_whitelist_menu
             ;;
-        10)
+        9)
             signing_hash_menu
             ;;
-        11)
+        10)
             echo "Tam biet."
             exit 0
             ;;
@@ -1524,7 +1283,7 @@ TKEOF
 
 chmod +x "$INSTALL_DIR/mtunnel-menu.sh"
 ln -sf "$INSTALL_DIR/mtunnel-menu.sh" /usr/local/bin/mtunnel-token
-log "Menu quan ly tong hop da tao — go 'mtunnel-token' de mo (doi token/pubkey/TLS pin/health/log/restart/signing-key/dex-hash/attestation-whitelist)"
+log "Menu quan ly tong hop da tao — go 'mtunnel-token' de mo (doi token/pubkey/TLS pin/health/log/restart/signing-key/signing-hash/attestation-whitelist)"
 
 # ── 6. Systemd service ──────────────────────────────────────
 log "Tao systemd service..."

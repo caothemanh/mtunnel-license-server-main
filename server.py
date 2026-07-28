@@ -38,7 +38,6 @@ CONFIG_DATA_FILE  = os.path.join(INSTALL_DIR, ".config_data.json")
 SIGNING_KEY_FILE  = os.path.join(INSTALL_DIR, ".signing_key")
 GITHUB_TOKEN_FILE = os.path.join(INSTALL_DIR, ".github_token")
 GITHUB_REPO_FILE  = os.path.join(INSTALL_DIR, ".github_repo")
-DEX_HASHES_FILE   = os.path.join(INSTALL_DIR, ".dex_hashes.json")
 DEVICE_BLOCKED_FILE = os.path.join(INSTALL_DIR, ".attestation_blocked_devices.json")
 # Whitelist SHA-256 (hex) của chữ ký ký APK thật (bản build gốc, có thể có
 # nhiều giá trị khi đang rollout key mới) — xem compute_signing_hash.py.
@@ -51,7 +50,6 @@ ATTESTATION_SIGNING_HASHES_FILE = os.path.join(INSTALL_DIR, ".attestation_signin
 
 CACHE_TTL        = 3600
 GITHUB_FETCH_TTL = 60
-DEX_NONCE_TTL    = 60   # nonce phải được dùng trong 60s, dùng 1 lần rồi bỏ
 ATTESTATION_NONCE_TTL       = 60
 ATTESTATION_ROOT_CACHE_TTL  = 86400   # 24h — danh sách root Google ít khi đổi
                                         # (nhưng CÓ đổi, như đợt rotate 4/2026,
@@ -59,16 +57,28 @@ ATTESTATION_ROOT_CACHE_TTL  = 86400   # 24h — danh sách root Google ít khi �
                                         # định kỳ thay vì fix 1 lần rồi thôi)
 GOOGLE_ATTESTATION_ROOT_URL = "https://android.googleapis.com/attestation/root"
 
-# nonce đang "sống" (đã phát cho app, chưa được app dùng để verify)
-# -> chống replay: 1 nonce chỉ đổi lấy được 1 câu trả lời đã ký duy nhất.
-_dex_nonces = {}
-_dex_nonce_lock = threading.Lock()
+# Danh sách serial number các key attestation ĐÃ BỊ THU HỒI (leak/compromise) —
+# Google công bố tại URL này. BẮT BUỘC phải tra danh sách này, không chỉ dựa
+# vào việc chain ký hợp lệ + root khớp Google: kẻ tấn công dùng 1 hardware
+# keybox THẬT nhưng đã bị rò rỉ (vd qua module Magisk "TrickyStore") vẫn tạo
+# ra được chain ký đúng 100%, root khớp Google, và tự khai verified_boot_state/
+# device_locked "sạch" — vì các trường đó nằm trong chính chứng chỉ do kẻ tấn
+# công tự dựng, không phải do TEE thật của máy đó sinh ra. Cách DUY NHẤT phát
+# hiện được kiểu giả mạo này là đối chiếu serial number với danh sách thu hồi
+# chính thức của Google (KHÔNG thể tự suy ra được từ nội dung chain).
+GOOGLE_ATTESTATION_STATUS_URL = "https://android.googleapis.com/attestation/status"
+ATTESTATION_STATUS_CACHE_TTL = 3600   # 1h — danh sách này cập nhật khá thường xuyên
+                                       # (mỗi lần có keybox mới bị leak/revoke),
+                                       # ngắn hơn nhiều so với cache root (86400s).
 
 _attestation_nonces = {}
 _attestation_nonce_lock = threading.Lock()
 
 _attestation_roots_cache = {"certs": [], "fetched_at": 0}
 _attestation_roots_lock = threading.Lock()
+
+_attestation_status_cache = {"entries": {}, "fetched_at": 0}
+_attestation_status_lock = threading.Lock()
 
 _device_blocked_lock = threading.Lock()
 
@@ -300,20 +310,6 @@ def verify():
     return jsonify({"valid": True, "expire_at": expire_at})
 
 
-def _load_dex_hashes():
-    """
-    File .dex_hashes.json chứa danh sách các combined-hash HỢP LỆ hiện tại,
-    ví dụ khi đang rollout bản mới thì để cả hash bản cũ + bản mới cùng lúc:
-      {"allowed": ["<sha256 hex bản 1.0.3>", "<sha256 hex bản 1.0.4>"]}
-    Combined-hash = sha256(nối các sha256 của từng classes*.dex, đã sort tên file),
-    tính bằng script build-time (xem compute_dex_hash.py), KHÔNG tính trên server.
-    """
-    try:
-        with open(DEX_HASHES_FILE, "r") as f:
-            return json.load(f).get("allowed", [])
-    except:
-        return []
-
 def _load_allowed_signing_hashes():
     """
     File .attestation_signing_hashes.json:
@@ -327,82 +323,6 @@ def _load_allowed_signing_hashes():
             return set(h.lower() for h in json.load(f).get("allowed", []))
     except:
         return set()
-
-def _dex_nonce_cleanup():
-    now = time.time()
-    with _dex_nonce_lock:
-        for n in [n for n, exp in _dex_nonces.items() if exp < now]:
-            del _dex_nonces[n]
-
-@app.route("/api/dex-challenge", methods=["POST"])
-@limiter.limit("30 per minute")
-def dex_challenge():
-    data  = request.get_json(force=True, silent=True) or {}
-    token = data.get("token", "")
-    pkg   = data.get("pkg",   "")
-    ip    = request.remote_addr
-
-    ok, reason = _check_auth(token, pkg)
-    if not ok:
-        # DEBUG TẠM THỜI — in token rút gọn (an toàn, không lộ toàn bộ) để
-        # so sánh trực tiếp với token đang hoạt động ở /api/config. XOÁ
-        # dòng debug_token này sau khi tìm ra nguyên nhân.
-        debug_token = (token[:8] + "...") if token else "(RỖNG)"
-        app.logger.warning(f"[dex-challenge] DENIED {ip}: {reason} | token_nhan_duoc={debug_token} | pkg_nhan_duoc={pkg or '(RỖNG)'}")
-        return jsonify({"error": reason}), 403
-
-    _dex_nonce_cleanup()
-    nonce = base64.urlsafe_b64encode(os.urandom(24)).decode()
-    with _dex_nonce_lock:
-        _dex_nonces[nonce] = time.time() + DEX_NONCE_TTL
-
-    return jsonify({"nonce": nonce, "expires_in": DEX_NONCE_TTL})
-
-
-@app.route("/api/dex-verify", methods=["POST"])
-@limiter.limit("30 per minute")
-def dex_verify():
-    data     = request.get_json(force=True, silent=True) or {}
-    token    = data.get("token", "")
-    pkg      = data.get("pkg",   "")
-    nonce    = data.get("nonce", "")
-    dex_hash = data.get("dex_hash", "")
-    ip       = request.remote_addr
-
-    ok, reason = _check_auth(token, pkg)
-    if not ok:
-        app.logger.warning(f"[dex-verify] AUTH FAILED {ip}: {reason}")
-        return jsonify({"valid": False, "reason": reason})
-
-    # Nonce phải tồn tại + chưa hết hạn + CHỈ dùng được đúng 1 lần (pop luôn)
-    with _dex_nonce_lock:
-        expire_at = _dex_nonces.pop(nonce, None)
-    if expire_at is None or expire_at < time.time():
-        app.logger.warning(f"[dex-verify] REJECT {ip}: bad_or_reused_or_expired_nonce")
-        return jsonify({"valid": False, "reason": "bad_or_expired_nonce"})
-
-    allowed  = _load_dex_hashes()
-    is_valid = any(hmac.compare_digest(dex_hash, h) for h in allowed) if dex_hash else False
-
-    # Ký kết quả (không chỉ trả true/false thô) — app verify chữ ký bằng
-    # đúng public key Ed25519 đã pin sẵn (giống luồng /api/config), nên
-    # kẻ tấn công có full quyền trên máy (root) chặn được response ở tầng
-    # transport vẫn KHÔNG tự chế được response "valid=true" hợp lệ nếu
-    # không có private key trên server. nonce được nhúng lại vào payload
-    # để app đối chiếu đúng câu hỏi nó vừa hỏi, chặn replay 1 response cũ.
-    result_payload = {"valid": is_valid, "nonce": nonce, "ts": int(time.time())}
-    message = json.dumps(result_payload, sort_keys=True, separators=(",", ":")).encode()
-    signature = SIGNING_KEY.sign(message)
-
-    if is_valid:
-        app.logger.info(f"[dex-verify] OK {ip} | pkg={pkg}")
-    else:
-        app.logger.warning(f"[dex-verify] MISMATCH {ip} | pkg={pkg} | got={dex_hash[:16] if dex_hash else '(empty)'}...")
-
-    return jsonify({
-        "result": base64.b64encode(message).decode(),
-        "signature": base64.b64encode(signature).decode()
-    })
 
 
 def _get_google_attestation_roots():
@@ -436,6 +356,44 @@ def _get_google_attestation_roots():
         # vì 1 lần Google tạm không phản hồi được.
         with _attestation_roots_lock:
             return list(_attestation_roots_cache["certs"])
+
+
+def _get_revoked_attestation_serials():
+    """
+    Tai danh sach serial number (dang hex, lowercase, khong '0x') cua cac
+    key attestation DA BI THU HOI, tu GOOGLE_ATTESTATION_STATUS_URL. Cache
+    lai ATTESTATION_STATUS_CACHE_TTL giay. Format JSON tra ve:
+      {"entries": {"<serial_hex>": {"status": "REVOKED"|"SUSPENDED", "reason": "..."}}}
+    Chi nhung serial CO van de moi xuat hien trong danh sach nay (khong phai
+    liet ke toan bo key da cap).
+    """
+    now = time.time()
+    with _attestation_status_lock:
+        if _attestation_status_cache["entries"] and \
+           (now - _attestation_status_cache["fetched_at"] < ATTESTATION_STATUS_CACHE_TTL):
+            return _attestation_status_cache["entries"]
+
+    try:
+        req = urllib.request.Request(
+            GOOGLE_ATTESTATION_STATUS_URL,
+            headers={"User-Agent": "mtunnel-license-server/1.0"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            doc = json.loads(resp.read().decode())
+        entries = doc.get("entries", {})
+        # Chuan hoa key ve lowercase (Google tra ve da lowercase, nhung phong
+        # truong hop thay doi trong tuong lai) de so sanh khong bi lech.
+        entries = {k.lower(): v for k, v in entries.items()}
+        with _attestation_status_lock:
+            _attestation_status_cache["entries"] = entries
+            _attestation_status_cache["fetched_at"] = now
+        app.logger.info(f"[attestation] Da tai {len(entries)} serial bi thu hoi tu Google")
+        return entries
+    except Exception as e:
+        app.logger.error(f"[attestation] Loi tai danh sach thu hoi tu Google: {e}")
+        # Dung cache cu (du het han) thay vi fail cung/bo qua check chi vi
+        # 1 lan Google tam khong phan hoi duoc.
+        with _attestation_status_lock:
+            return dict(_attestation_status_cache["entries"])
 
 
 # ══════════════════════════════════════════════════════════════
@@ -714,6 +672,34 @@ def _verify_attestation_chain(cert_chain_der_list):
         except Exception as e:
             app.logger.warning(f"[attestation-verify] DEBUG log that bai: {e}")
         return False, "root_khong_khop_google", None
+
+    # ── Kiểm tra thu hồi (BẮT BUỘC) ──────────────────────────────────────
+    # Chain ký hợp lệ + root khớp Google KHÔNG đủ để tin cậy: nếu 1 hardware
+    # keybox thật đã bị rò rỉ (vd bị bán/leak, dùng qua module kiểu
+    # "TrickyStore" trên máy root), kẻ tấn công vẫn tự dựng được 1 chain
+    # ký đúng 100% về mặt mật mã, root vẫn khớp Google — vì họ có private
+    # key thật của keybox đó. verified_boot_state/device_locked trong chain
+    # đó cũng do CHÍNH kẻ tấn công tự điền lúc dựng chain giả, nên không thể
+    # dùng 2 trường đó để phát hiện. Cách DUY NHẤT là đối chiếu serial number
+    # từng cert trong chain với danh sách thu hồi chính thức của Google.
+    revoked_serials = _get_revoked_attestation_serials()
+    if revoked_serials:
+        for idx, cert in enumerate(certs):
+            serial_hex = format(cert.serial_number, "x")   # hex lowercase, khong '0x', khong leading zero
+            entry = revoked_serials.get(serial_hex)
+            if entry is not None:
+                status = entry.get("status", "UNKNOWN")
+                reason = entry.get("reason", "khong_ro")
+                app.logger.warning(
+                    f"[attestation-verify] REJECT: cert_bi_thu_hoi vi_tri={idx} "
+                    f"serial={serial_hex} status={status} reason={reason}")
+                return False, f"cert_thu_hoi:{status}:{reason}", None
+    else:
+        # Không tải được danh sách thu hồi (Google lỗi + chưa có cache) —
+        # KHÔNG âm thầm coi như "sạch". Từ chối rõ ràng để không bao giờ
+        # vô tình bỏ qua bước kiểm tra quan trọng nhất chống leaked-keybox.
+        app.logger.error("[attestation-verify] REJECT: khong_tai_duoc_danh_sach_thu_hoi")
+        return False, "khong_tai_duoc_danh_sach_thu_hoi", None
 
     return True, None, certs[0]
 
