@@ -873,6 +873,27 @@ def _is_device_whitelisted(device_id: str) -> bool:
         return False
 
 
+def _is_device_blacklisted(device_id: str) -> bool:
+    """
+    Kiem tra device_id co dang bi blacklist do server DA tung phat hien
+    bang chung root/mo khoa bootloader that su (khong phai chi package/
+    signing-hash khong khop) hay khong. Danh sach nay duoc _record_blocked_
+    device() tu dong danh dau "blacklisted": True khi phat hien root, va
+    duoc doc lai o day de tu choi MOI request tiep theo cua chinh device_id
+    do — cho toi khi admin xoa khoi blacklist hoac them vao whitelist qua
+    menu 'mtunnel-token'.
+    """
+    if not device_id:
+        return False
+    try:
+        with open(DEVICE_BLOCKED_FILE, "r") as f:
+            blocked = json.load(f).get("blocked", {})
+        entry = blocked.get(device_id)
+        return bool(entry) and entry.get("blacklisted", False)
+    except Exception:
+        return False
+
+
 def _record_blocked_device(device_id: str, ip: str, pkg: str, verified_boot_state, device_locked,
                             package_ok=None, sig_ok=None):
     """
@@ -880,9 +901,13 @@ def _record_blocked_device(device_id: str, ip: str, pkg: str, verified_boot_stat
     attestation ticket hop le nhung payload["valid"]==False — co the do
     root/mo khoa bootloader, HOAC do package/signing-hash khong khop (vd
     chua cau hinh menu 9 - Signing Hash Allow-list, hoac dung sai package).
-    Danh sach nay CHI de xem lai qua menu 'mtunnel-token' -> Attestation
-    Whitelist, tien cho viec whitelist nhanh 1 may cu the neu can — KHONG
-    anh huong logic chan/cho phep.
+    Danh sach nay dung de xem lai qua menu 'mtunnel-token' -> Attestation
+    Whitelist, tien cho viec whitelist nhanh 1 may cu the neu can. Neu ly
+    do bi chan la bang chung root/mo khoa bootloader that su (khong phai
+    chi package/signing-hash khong khop), device_id se TU DONG duoc danh
+    dau "blacklisted": True va bi tu choi thang moi request /api/config
+    tiep theo (xem _is_device_blacklisted), cho toi khi admin go blacklist
+    hoac them vao whitelist.
     """
     if not device_id:
         return
@@ -898,6 +923,14 @@ def _record_blocked_device(device_id: str, ip: str, pkg: str, verified_boot_stat
     if not reasons:
         reasons.append("khong_xac_dinh")
     reason = ",".join(reasons)
+
+    # Chi coi la "root that su" (va tu dong blacklist vinh vien) khi co bang
+    # chung ro rang tu Key Attestation ve bootloader/verified-boot — KHONG
+    # tu dong blacklist chi vi package/signing-hash khong khop, vi truong
+    # hop do co the do admin chua cau hinh menu 9 (Signing Hash Allow-list)
+    # hoac client goi sai package, khong phai loi cua thiet bi.
+    is_root_evidence = (device_locked is False) or \
+        (verified_boot_state is not None and verified_boot_state != 0)
 
     with _device_blocked_lock:
         try:
@@ -916,6 +949,12 @@ def _record_blocked_device(device_id: str, ip: str, pkg: str, verified_boot_stat
         entry["package_ok"] = package_ok
         entry["sig_ok"] = sig_ok
         entry["reason"] = reason
+        if is_root_evidence and not entry.get("blacklisted"):
+            entry["blacklisted"] = True
+            entry["blacklisted_at"] = int(time.time())
+            entry["blacklisted_reason"] = reason
+            app.logger.warning(
+                f"[attestation-block] BLACKLIST device_id={device_id} | reason={reason} | ip={ip}")
         try:
             tmp = DEVICE_BLOCKED_FILE + ".tmp"
             with open(tmp, "w") as f:
@@ -987,6 +1026,14 @@ def get_config():
 
     if _is_device_whitelisted(device_id):
         app.logger.info(f"[config] BYPASS attestation (whitelisted device_id={device_id}) {ip}")
+    elif _is_device_blacklisted(device_id):
+        # Thiet bi nay da tung bi phat hien bang chung root/mo khoa
+        # bootloader that su qua Key Attestation truoc do — tu choi thang,
+        # KHONG can verify lai ticket. Chi duoc go blacklist bang cach xoa
+        # khoi file .attestation_blocked_devices.json hoac them vao
+        # whitelist qua menu 'mtunnel-token'.
+        app.logger.warning(f"[config] DENIED (blacklisted) device_id={device_id} {ip}")
+        return jsonify({"error": "device_blacklisted_root_detected"}), 403
     else:
         # Config chỉ được trả nếu kèm 1 vé Key Attestation còn hạn, đúng pkg,
         # và server tự verify chữ ký (KHÔNG tin app tự khai báo gì cả) — đây

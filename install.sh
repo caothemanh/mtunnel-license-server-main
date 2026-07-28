@@ -816,7 +816,8 @@ else:
         count = info.get("count", 1)
         pkg = info.get("pkg", "?")
         ip = info.get("last_ip", "?")
-        print(f"  {i}) {device_id}")
+        bl_tag = " [DA BLACKLIST - tu choi thang moi request]" if info.get("blacklisted") else ""
+        print(f"  {i}) {device_id}{bl_tag}")
         print(f"       ly_do={reason} | lan_cuoi={last_seen_str} | so_lan={count} | pkg={pkg} | ip={ip}")
 PYEOF
 }
@@ -949,8 +950,11 @@ blocked_devices_menu() {
         echo ""
         echo -e "${YELLOW}Day la cac device_id ma server DA verify Key Attestation${NC}"
         echo -e "${YELLOW}that (ve ky hop le) nhung bi tu choi vi root hoac bootloader${NC}"
-        echo -e "${YELLOW}dang mo khoa. Server tu dong ghi lai moi khi /api/config bi${NC}"
-        echo -e "${YELLOW}tu choi vi ly do nay — khong can lam gi them.${NC}"
+        echo -e "${YELLOW}dang mo khoa. Nhung thiet bi co bang chung root/mo khoa that${NC}"
+        echo -e "${YELLOW}su se duoc tu dong danh dau [DA BLACKLIST] va bi TU CHOI THANG${NC}"
+        echo -e "${YELLOW}moi request /api/config tiep theo — khong can lam gi them.${NC}"
+        echo -e "${YELLOW}Muon mo lai cho 1 may: dung muc 1 (them vao whitelist) hoac${NC}"
+        echo -e "${YELLOW}muc 2 (xoa khoi danh sach nay se go blacklist).${NC}"
         echo ""
         list_blocked_devices
         echo ""
@@ -985,7 +989,7 @@ blocked_devices_menu() {
                 ;;
             2)
                 echo -e "${YELLOW}Nhap cac so muon xoa, cach nhau boi dau phay hoac khoang trang (vd: 1,3,5).${NC}"
-                echo -e "${YELLOW}Go 'all' de xoa tat ca. Enter de huy. (Chi xoa khoi log, khong anh huong whitelist)${NC}"
+                echo -e "${YELLOW}Go 'all' de xoa tat ca. Enter de huy. (Xoa se go blacklist neu co, khong anh huong whitelist)${NC}"
                 read -p "Chon: " BD_IDX
                 if [ -n "$BD_IDX" ]; then
                     BD_PREVIEW=$(preview_blocked_selection "$BD_IDX")
