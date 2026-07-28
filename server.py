@@ -823,6 +823,8 @@ def attestation_verify():
         "pkg": pkg,
         "verified_boot_state": parsed["verified_boot_state"],
         "device_locked": parsed["device_locked"],
+        "package_ok": package_ok,
+        "sig_ok": sig_ok,
         "challenge": challenge_b64,
         "ts": int(time.time()),
     }
@@ -871,13 +873,16 @@ def _is_device_whitelisted(device_id: str) -> bool:
         return False
 
 
-def _record_blocked_device(device_id: str, ip: str, pkg: str, verified_boot_state, device_locked):
+def _record_blocked_device(device_id: str, ip: str, pkg: str, verified_boot_state, device_locked,
+                            package_ok=None, sig_ok=None):
     """
-    Ghi lai (hoac cap nhat) 1 thiet bi bi server tu choi cap config vi Key
-    Attestation phat hien root/mo khoa bootloader (attestation ticket hop
-    le nhung payload["valid"]==False). Danh sach nay CHI de xem lai qua
-    menu 'mtunnel-token' -> Attestation Whitelist, tien cho viec whitelist
-    nhanh 1 may cu the neu can — KHONG anh huong logic chan/cho phep.
+    Ghi lai (hoac cap nhat) 1 thiet bi bi server tu choi cap config vi
+    attestation ticket hop le nhung payload["valid"]==False — co the do
+    root/mo khoa bootloader, HOAC do package/signing-hash khong khop (vd
+    chua cau hinh menu 9 - Signing Hash Allow-list, hoac dung sai package).
+    Danh sach nay CHI de xem lai qua menu 'mtunnel-token' -> Attestation
+    Whitelist, tien cho viec whitelist nhanh 1 may cu the neu can — KHONG
+    anh huong logic chan/cho phep.
     """
     if not device_id:
         return
@@ -886,6 +891,10 @@ def _record_blocked_device(device_id: str, ip: str, pkg: str, verified_boot_stat
         reasons.append("bootloader_mo_khoa")
     if verified_boot_state is not None and verified_boot_state != 0:
         reasons.append("verified_boot_khong_hop_le")
+    if package_ok is False:
+        reasons.append("package_khong_khop")
+    if sig_ok is False:
+        reasons.append("signing_hash_khong_khop_hoac_chua_cau_hinh_menu9")
     if not reasons:
         reasons.append("khong_xac_dinh")
     reason = ",".join(reasons)
@@ -904,6 +913,8 @@ def _record_blocked_device(device_id: str, ip: str, pkg: str, verified_boot_stat
         entry["pkg"] = pkg
         entry["verified_boot_state"] = verified_boot_state
         entry["device_locked"] = device_locked
+        entry["package_ok"] = package_ok
+        entry["sig_ok"] = sig_ok
         entry["reason"] = reason
         try:
             tmp = DEVICE_BLOCKED_FILE + ".tmp"
@@ -992,6 +1003,8 @@ def get_config():
                     device_id, ip, pkg,
                     ticket_payload.get("verified_boot_state"),
                     ticket_payload.get("device_locked"),
+                    ticket_payload.get("package_ok"),
+                    ticket_payload.get("sig_ok"),
                 )
             app.logger.warning(f"[config] DENIED (attestation) from {ip}: {ticket_reason} | device_id={device_id or '(rong)'}")
             return jsonify({"error": ticket_reason}), 403
