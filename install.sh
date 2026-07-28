@@ -289,6 +289,8 @@ SIGNING_KEY_FILE="$INSTALL_DIR/.signing_key"
 ATTESTATION_SIGNING_HASHES_FILE="$INSTALL_DIR/.attestation_signing_hashes.json"
 DEVICE_WHITELIST_FILE="$INSTALL_DIR/.attestation_whitelist.json"
 DEVICE_BLOCKED_FILE="$INSTALL_DIR/.attestation_blocked_devices.json"
+GITHUB_REPO_FILE="$INSTALL_DIR/.github_repo"
+GITHUB_TOKEN_FILE="$INSTALL_DIR/.github_token"
 APK_UPLOAD_DIR="$INSTALL_DIR/apk_uploads"
 mkdir -p "$APK_UPLOAD_DIR"
 chown www-data:www-data "$APK_UPLOAD_DIR" 2>/dev/null || true
@@ -1197,6 +1199,95 @@ with open('$SIGNING_KEY_FILE', 'wb') as f:
     esac
 }
 
+github_config_menu() {
+    echo -e "${CYAN}${BOLD}--- Cau hinh GitHub cho /api/config ---${NC}"
+    echo ""
+    if [ -f "$GITHUB_REPO_FILE" ] && [ -s "$GITHUB_REPO_FILE" ]; then
+        CUR_OWNER=$(grep "^OWNER=" "$GITHUB_REPO_FILE" | cut -d= -f2-)
+        CUR_REPO=$(grep "^REPO=" "$GITHUB_REPO_FILE" | cut -d= -f2-)
+        CUR_BRANCH=$(grep "^BRANCH=" "$GITHUB_REPO_FILE" | cut -d= -f2-)
+        CUR_PATH=$(grep "^PATH=" "$GITHUB_REPO_FILE" | cut -d= -f2-)
+        echo -e "${YELLOW}Cau hinh hien tai:${NC}"
+        echo "  Owner  : ${CUR_OWNER:-(rong)}"
+        echo "  Repo   : ${CUR_REPO:-(rong)}"
+        echo "  Branch : ${CUR_BRANCH:-(rong)}"
+        echo "  Path   : ${CUR_PATH:-(rong)}"
+        if [ -f "$GITHUB_TOKEN_FILE" ] && [ -s "$GITHUB_TOKEN_FILE" ]; then
+            echo "  Token  : da luu (an)"
+        else
+            echo -e "  Token  : ${RED}chua co${NC}"
+        fi
+    else
+        echo -e "${RED}Chua cau hinh GitHub — /api/config dang tra loi 500 (config_unavailable).${NC}"
+    fi
+    echo ""
+    echo "  1) Nhap/Cap nhat cau hinh GitHub (owner, repo, branch, path, token)"
+    echo "  2) Xoa cau hinh GitHub"
+    echo "  3) Quay lai"
+    echo ""
+    read -p "Chon [1-3]: " GH_CHOICE
+    echo ""
+    case "$GH_CHOICE" in
+        1)
+            printf "${CYAN}GitHub owner${NC} [vd: caothemanh]${CUR_OWNER:+ (Enter de giu \"$CUR_OWNER\")}: "
+            read GH_OWNER_NEW
+            GH_OWNER_NEW=${GH_OWNER_NEW:-$CUR_OWNER}
+            printf "${CYAN}GitHub repo${NC} [vd: mtunnel-config]${CUR_REPO:+ (Enter de giu \"$CUR_REPO\")}: "
+            read GH_REPO_NEW
+            GH_REPO_NEW=${GH_REPO_NEW:-$CUR_REPO}
+            printf "${CYAN}Branch${NC} [main]${CUR_BRANCH:+ (Enter de giu \"$CUR_BRANCH\")}: "
+            read GH_BRANCH_NEW
+            GH_BRANCH_NEW=${GH_BRANCH_NEW:-${CUR_BRANCH:-main}}
+            printf "${CYAN}Duong dan file trong repo${NC} [vd: config.enc]${CUR_PATH:+ (Enter de giu \"$CUR_PATH\")}: "
+            read GH_PATH_NEW
+            GH_PATH_NEW=${GH_PATH_NEW:-$CUR_PATH}
+            printf "${CYAN}GitHub Personal Access Token (PAT, an khi go, Enter de giu token cu)${NC}: "
+            read -s GH_TOKEN_NEW
+            echo ""
+
+            if [ -z "$GH_OWNER_NEW" ] || [ -z "$GH_REPO_NEW" ] || [ -z "$GH_PATH_NEW" ]; then
+                echo -e "${RED}Owner, Repo va Duong dan file khong duoc de trong. Da huy.${NC}"
+                return
+            fi
+            if [ -z "$GH_TOKEN_NEW" ] && [ ! -s "$GITHUB_TOKEN_FILE" ]; then
+                echo -e "${RED}Chua co token cu de giu lai — phai nhap token. Da huy.${NC}"
+                return
+            fi
+
+            cat > "$GITHUB_REPO_FILE" << GHEOF
+OWNER=$GH_OWNER_NEW
+REPO=$GH_REPO_NEW
+BRANCH=$GH_BRANCH_NEW
+PATH=$GH_PATH_NEW
+GHEOF
+            chmod 600 "$GITHUB_REPO_FILE"
+            chown www-data:www-data "$GITHUB_REPO_FILE" 2>/dev/null || true
+
+            if [ -n "$GH_TOKEN_NEW" ]; then
+                echo "$GH_TOKEN_NEW" > "$GITHUB_TOKEN_FILE"
+                chmod 600 "$GITHUB_TOKEN_FILE"
+                chown www-data:www-data "$GITHUB_TOKEN_FILE" 2>/dev/null || true
+            fi
+
+            systemctl restart mtunnel-license 2>/dev/null || true
+            echo -e "${GREEN}✅ Da luu cau hinh GitHub (owner=$GH_OWNER_NEW repo=$GH_REPO_NEW branch=$GH_BRANCH_NEW path=$GH_PATH_NEW).${NC}"
+            echo -e "${YELLOW}Kiem tra lai bang menu 4 (Xem trang thai server) hoac /api/config.${NC}"
+            ;;
+        2)
+            read -p "Xac nhan xoa cau hinh GitHub? /api/config se ngung hoat dong cho toi khi cau hinh lai. [y/N]: " GH_CONFIRM
+            if [[ "$GH_CONFIRM" == "y" || "$GH_CONFIRM" == "Y" ]]; then
+                rm -f "$GITHUB_REPO_FILE" "$GITHUB_TOKEN_FILE"
+                systemctl restart mtunnel-license 2>/dev/null || true
+                echo -e "${GREEN}✅ Da xoa cau hinh GitHub.${NC}"
+            else
+                echo -e "${YELLOW}Da huy.${NC}"
+            fi
+            ;;
+        3) return ;;
+        *) echo -e "${RED}Lua chon khong hop le.${NC}" ;;
+    esac
+}
+
 change_port_menu() {
     echo -e "${CYAN}${BOLD}--- Doi port HTTPS ---${NC}"
     echo ""
@@ -1270,10 +1361,11 @@ while true; do
     echo "  7) Quan ly Signing Key (Export/Import giua cac VPS)"
     echo "  8) Quan ly Attestation Whitelist (cho phep may root hoat dong)"
     echo "  9) Quan ly Signing Hash Allow-list (Key Attestation - chong resign/inject APK)"
-    echo "  10) Doi port HTTPS"
-    echo "  11) Thoat"
+    echo "  10) Cau hinh GitHub cho /api/config (owner/repo/branch/path/token)"
+    echo "  11) Doi port HTTPS"
+    echo "  12) Thoat"
     echo ""
-    read -p "Nhap lua chon [1-11]: " CHOICE
+    read -p "Nhap lua chon [1-12]: " CHOICE
     echo ""
 
     case "$CHOICE" in
@@ -1336,9 +1428,12 @@ while true; do
             signing_hash_menu
             ;;
         10)
-            change_port_menu
+            github_config_menu
             ;;
         11)
+            change_port_menu
+            ;;
+        12)
             echo "Tam biet."
             exit 0
             ;;
