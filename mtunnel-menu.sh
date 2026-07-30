@@ -798,11 +798,11 @@ attestation_whitelist_menu() {
         echo ""
         case "$WL_CHOICE" in
             1)
-                echo -e "${CYAN}Huong dan lay device_id:${NC}"
-                echo "  1. Chay app tren thiet bi can whitelist"
-                echo "  2. device_id duoc app gui kem trong request /api/config"
-                echo "     (xem trong log server: journalctl -u mtunnel-license -f)"
-                echo "  3. Copy device_id roi paste vao day"
+                show_submenu_header "📱 HƯỚNG DẪN LẤY DEVICE_ID"
+                echo -e "  ${CYAN}[1]${NC}  ${YELLOW}CHẠY APP TRÊN THIẾT BỊ CẦN WHITELIST${NC}"
+                echo -e "  ${CYAN}[2]${NC}  ${YELLOW}DEVICE_ID ĐƯỢC APP GỬI KÈM TRONG REQUEST /API/CONFIG${NC}"
+                echo -e "       (xem trong log server: journalctl -u mtunnel-license -f)"
+                echo -e "  ${CYAN}[3]${NC}  ${YELLOW}COPY DEVICE_ID RỒI PASTE VÀO ĐÂY${NC}"
                 echo ""
                 read -p "Nhap device_id: " NEW_DEVICE_ID
                 if [ -z "$NEW_DEVICE_ID" ]; then
@@ -1212,11 +1212,11 @@ while true; do
 
     case "$CHOICE" in
         1)
-            echo -e "${CYAN}Huong dan lay token:${NC}"
-            echo "  1. Build release APK (cung keystore)"
-            echo "  2. Chay app tren thiet bi"
-            echo "  3. Token hien trong AlertDialog luc khoi dong"
-            echo "  4. Copy token roi paste vao day"
+            show_submenu_header "🎫 HƯỚNG DẪN LẤY TOKEN"
+            echo -e "  ${CYAN}[1]${NC}  ${YELLOW}BUILD RELEASE APK${NC} (cùng keystore)"
+            echo -e "  ${CYAN}[2]${NC}  ${YELLOW}CHẠY APP TRÊN THIẾT BỊ${NC}"
+            echo -e "  ${CYAN}[3]${NC}  ${YELLOW}TOKEN HIỆN TRONG ALERTDIALOG LÚC KHỞI ĐỘNG${NC}"
+            echo -e "  ${CYAN}[4]${NC}  ${YELLOW}COPY TOKEN RỒI PASTE VÀO ĐÂY${NC}"
             echo ""
             read -p "Nhap token moi: " NEW_TOKEN
             if [ -z "$NEW_TOKEN" ]; then
