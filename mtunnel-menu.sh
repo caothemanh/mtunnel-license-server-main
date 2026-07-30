@@ -9,6 +9,7 @@ WHITE='\033[1;37m'
 BLUE='\033[1;34m'
 PINK='\033[1;35m'
 BGRED='\033[41;1;37m'
+BGBLUE='\033[44;1;37m'
 
 INSTALL_DIR="/opt/mtunnel"
 PANEL_GITHUB_RAW="https://raw.githubusercontent.com/caothemanh/mtunnel-license-server-main/main"
@@ -78,6 +79,18 @@ show_header() {
         echo -e "  ${PINK}Token  :${NC} ${YELLOW}(chưa thiết lập)${NC}"
     fi
     echo -e "${BLUE}${line}${NC}"
+    echo ""
+}
+
+show_submenu_header() {
+    local title="$1"
+    local cols
+    cols=$(tput cols 2>/dev/null)
+    [ -z "$cols" ] && cols=60
+    [ "$cols" -lt 40 ] && cols=60
+    local pad=$((cols - 2))
+    [ "$pad" -lt 0 ] && pad=0
+    printf "${BGBLUE} %-*s${NC}\n" "$pad" "$title"
     echo ""
 }
 
@@ -332,15 +345,14 @@ PYEOF
 
 signing_hash_menu() {
     while true; do
-        echo -e "${CYAN}${BOLD}--- Quan ly Signing Hash Allow-list (/api/attestation-verify) ---${NC}"
-        echo ""
+        show_submenu_header "🔐 QUẢN LÝ SIGNING HASH ALLOW-LIST (/API/ATTESTATION-VERIFY)"
         echo -e "${YELLOW}Hash nay doi chieu voi AttestationApplicationId trong chain Key${NC}"
         echo -e "${YELLOW}Attestation phan cung — khong the gia mao bang hook/resign APK.${NC}"
         echo ""
-        echo "  1) Them hash tu file APK (chon theo so, khong go duong dan)"
-        echo "  2) Xem danh sach hash dang duoc phep"
-        echo "  3) Xoa 1 hash khoi allow-list"
-        echo "  4) Quay lai"
+        echo -e "  ${CYAN}[1]${NC}  ${YELLOW}THÊM HASH TỪ FILE APK${NC} (chọn theo số, không gõ đường dẫn)"
+        echo -e "  ${CYAN}[2]${NC}  ${YELLOW}XEM DANH SÁCH HASH ĐANG ĐƯỢC PHÉP${NC}"
+        echo -e "  ${CYAN}[3]${NC}  ${YELLOW}XÓA 1 HASH KHỎI ALLOW-LIST${NC}"
+        echo -e "  ${CYAN}[4]${NC}  ${WHITE}QUAY LẠI${NC}"
         echo ""
         read -p "Chon [1-4]: " SH_CHOICE
         echo ""
@@ -683,8 +695,7 @@ PYEOF
 
 blocked_devices_menu() {
     while true; do
-        echo -e "${CYAN}${BOLD}--- Thiet bi bi chan (root / bootloader mo khoa) ---${NC}"
-        echo ""
+        show_submenu_header "🚫 THIẾT BỊ BỊ CHẶN (ROOT / BOOTLOADER MỞ KHOÁ)"
         echo -e "${YELLOW}Day la cac device_id ma server DA verify Key Attestation${NC}"
         echo -e "${YELLOW}that (ve ky hop le) nhung bi tu choi vi root hoac bootloader${NC}"
         echo -e "${YELLOW}dang mo khoa. Nhung thiet bi co bang chung root/mo khoa that${NC}"
@@ -695,9 +706,9 @@ blocked_devices_menu() {
         echo ""
         list_blocked_devices
         echo ""
-        echo "  1) Them 1 thiet bi tu danh sach nay vao whitelist"
-        echo "  2) Xoa (don dep) khoi danh sach nay"
-        echo "  3) Quay lai"
+        echo -e "  ${CYAN}[1]${NC}  ${YELLOW}THÊM 1 THIẾT BỊ TỪ DANH SÁCH NÀY VÀO WHITELIST${NC}"
+        echo -e "  ${CYAN}[2]${NC}  ${YELLOW}XÓA (DỌN DẸP) KHỎI DANH SÁCH NÀY${NC}"
+        echo -e "  ${CYAN}[3]${NC}  ${WHITE}QUAY LẠI${NC}"
         echo ""
         read -p "Chon [1-3]: " BD_CHOICE
         echo ""
@@ -770,19 +781,18 @@ blocked_devices_menu() {
 
 attestation_whitelist_menu() {
     while true; do
-        echo -e "${CYAN}${BOLD}--- Quan ly Attestation Whitelist (bo qua Key Attestation theo device_id) ---${NC}"
-        echo ""
+        show_submenu_header "🛡️  QUẢN LÝ ATTESTATION WHITELIST (BỎ QUA KEY ATTESTATION THEO DEVICE_ID)"
         echo -e "${YELLOW}Thiet bi trong danh sach nay se duoc /api/config bo qua yeu cau${NC}"
         echo -e "${YELLOW}Key Attestation (bootloader khoa + Verified Boot) — dung cho may${NC}"
         echo -e "${YELLOW}root/da mo khoa bootloader can hoat dong duoc (vd may dev/tester).${NC}"
         echo -e "${RED}Chi nen whitelist may cu the, KHONG nen dung dai tra vi se mat${NC}"
         echo -e "${RED}tac dung chong root/patch cua co che attestation.${NC}"
         echo ""
-        echo "  1) Nhap device_id tu client de them vao whitelist"
-        echo "  2) Xem danh sach device_id dang duoc whitelist"
-        echo "  3) Xoa device_id khoi whitelist"
-        echo "  4) Xem thiet bi bi chan (root / bootloader mo khoa)"
-        echo "  5) Quay lai"
+        echo -e "  ${CYAN}[1]${NC}  ${YELLOW}NHẬP DEVICE_ID TỪ CLIENT ĐỂ THÊM VÀO WHITELIST${NC}"
+        echo -e "  ${CYAN}[2]${NC}  ${YELLOW}XEM DANH SÁCH DEVICE_ID ĐANG ĐƯỢC WHITELIST${NC}"
+        echo -e "  ${CYAN}[3]${NC}  ${YELLOW}XÓA DEVICE_ID KHỎI WHITELIST${NC}"
+        echo -e "  ${CYAN}[4]${NC}  ${YELLOW}XEM THIẾT BỊ BỊ CHẶN${NC} (root / bootloader mở khoá)"
+        echo -e "  ${CYAN}[5]${NC}  ${WHITE}QUAY LẠI${NC}"
         echo ""
         read -p "Chon [1-5]: " WL_CHOICE
         echo ""
@@ -863,17 +873,16 @@ attestation_whitelist_menu() {
 }
 
 signing_key_menu() {
-    echo -e "${CYAN}${BOLD}--- Quan ly Signing Key (Ed25519) ---${NC}"
-    echo ""
+    show_submenu_header "🔑 QUẢN LÝ SIGNING KEY (ED25519)"
     if [ -f "$SIGNING_KEY_FILE" ] && [ -s "$SIGNING_KEY_FILE" ]; then
         echo -e "${YELLOW}Public key hien tai:${NC} $(print_public_key 2>/dev/null)"
     else
         echo -e "${YELLOW}Chua co signing key nao.${NC}"
     fi
     echo ""
-    echo "  1) Export private key (dang base64) - de dung chung voi VPS khac"
-    echo "  2) Import private key (dang base64) - tu VPS khac"
-    echo "  3) Quay lai"
+    echo -e "  ${CYAN}[1]${NC}  ${YELLOW}EXPORT PRIVATE KEY${NC} (dạng base64 - để dùng chung với VPS khác)"
+    echo -e "  ${CYAN}[2]${NC}  ${YELLOW}IMPORT PRIVATE KEY${NC} (dạng base64 - từ VPS khác)"
+    echo -e "  ${CYAN}[3]${NC}  ${WHITE}QUAY LẠI${NC}"
     echo ""
     read -p "Chon [1-3]: " SK_CHOICE
     echo ""
@@ -935,8 +944,7 @@ with open('$SIGNING_KEY_FILE', 'wb') as f:
 }
 
 github_config_menu() {
-    echo -e "${CYAN}${BOLD}--- Cau hinh GitHub cho /api/config ---${NC}"
-    echo ""
+    show_submenu_header "⚙️  CẤU HÌNH GITHUB CHO /API/CONFIG"
     if [ -f "$GITHUB_REPO_FILE" ] && [ -s "$GITHUB_REPO_FILE" ]; then
         CUR_OWNER=$(grep "^OWNER=" "$GITHUB_REPO_FILE" | cut -d= -f2-)
         CUR_REPO=$(grep "^REPO=" "$GITHUB_REPO_FILE" | cut -d= -f2-)
@@ -956,9 +964,9 @@ github_config_menu() {
         echo -e "${RED}Chua cau hinh GitHub — /api/config dang tra loi 500 (config_unavailable).${NC}"
     fi
     echo ""
-    echo "  1) Nhap/Cap nhat cau hinh GitHub (owner, repo, branch, path, token)"
-    echo "  2) Xoa cau hinh GitHub"
-    echo "  3) Quay lai"
+    echo -e "  ${CYAN}[1]${NC}  ${YELLOW}NHẬP/CẬP NHẬT CẤU HÌNH GITHUB${NC} (owner, repo, branch, path, token)"
+    echo -e "  ${CYAN}[2]${NC}  ${YELLOW}XÓA CẤU HÌNH GITHUB${NC}"
+    echo -e "  ${CYAN}[3]${NC}  ${WHITE}QUAY LẠI${NC}"
     echo ""
     read -p "Chon [1-3]: " GH_CHOICE
     echo ""
@@ -1024,8 +1032,7 @@ GHEOF
 }
 
 change_port_menu() {
-    echo -e "${CYAN}${BOLD}--- Doi port HTTPS ---${NC}"
-    echo ""
+    show_submenu_header "🔌 ĐỔI PORT HTTPS"
     echo -e "Port hien tai: ${BOLD}$SSL_PORT${NC}"
     echo ""
     read -p "Nhap port moi (Enter de huy): " NEW_PORT
