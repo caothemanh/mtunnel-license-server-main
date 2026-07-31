@@ -39,6 +39,14 @@ SIGNING_KEY_FILE  = os.path.join(INSTALL_DIR, ".signing_key")
 GITHUB_TOKEN_FILE = os.path.join(INSTALL_DIR, ".github_token")
 GITHUB_REPO_FILE  = os.path.join(INSTALL_DIR, ".github_repo")
 DEVICE_BLOCKED_FILE = os.path.join(INSTALL_DIR, ".attestation_blocked_devices.json")
+# Bảng ánh xạ "server_id" (tên logic, KHÔNG phải domain DNS public) -> IP thật
+# phía sau (VPS chạy SSH/V2Ray/Psiphon). File này KHÔNG bao giờ được đưa vào
+# DNS zone/Cloudflare — chỉ tồn tại ở đây và chỉ lộ ra qua /api/resolve sau
+# khi verify token+attestation y hệt /api/config. Format:
+#   {"servers": {"<server_id>": {"ip": "...", "port": 443, "note": "...",
+#                                  "enabled": true, "updated_at": <epoch>}}}
+RESOLVE_SERVERS_FILE = os.path.join(INSTALL_DIR, ".resolve_servers.json")
+_resolve_servers_lock = threading.Lock()
 # Whitelist SHA-256 (hex) của chữ ký ký APK thật (bản build gốc, có thể có
 # nhiều giá trị khi đang rollout key mới) — xem compute_signing_hash.py.
 # Đây là "nguồn sự thật" độc lập với _check_auth()/token, vì giá trị được
@@ -964,6 +972,64 @@ def _record_blocked_device(device_id: str, ip: str, pkg: str, verified_boot_stat
             app.logger.error(f"[attestation-block] Loi ghi {DEVICE_BLOCKED_FILE}: {e}")
 
 
+def _load_resolve_servers():
+    """
+    Doc toan bo bang server_id -> {ip, port, note, enabled}. KHONG cache trong
+    RAM (khac _github_cache) vi bang nay nho va admin co the sua qua menu bat
+    ky luc nao — doc thang tu file de luon phan anh thay doi moi nhat.
+    """
+    try:
+        with open(RESOLVE_SERVERS_FILE, "r") as f:
+            return json.load(f).get("servers", {})
+    except Exception:
+        return {}
+
+
+def _get_resolve_server(server_id: str):
+    """
+    Tra 1 entry theo server_id, chi tra ve neu ton tai VA dang enabled=true.
+    Admin co the tam thoi "rut" 1 IP khoi luu hanh (bi lo/lam dung) bang cach
+    set enabled=false qua menu, ma khong can xoa han entry.
+    """
+    if not server_id:
+        return None
+    servers = _load_resolve_servers()
+    entry = servers.get(server_id)
+    if not entry or not entry.get("enabled", True):
+        return None
+    return entry
+
+
+def _log_resolve_lookup(server_id: str, device_id: str, ip: str):
+    """
+    Ghi lai (server_id, device_id, ip nguon) cua tung lan goi /api/resolve
+    thanh cong, luu vao chinh RESOLVE_SERVERS_FILE (key rieng "log", gioi han
+    50 dong gan nhat) de admin xem qua menu — phat hien som neu co token bi
+    danh cap va bi goi /api/resolve tu nhieu IP/device_id la thuong.
+    """
+    try:
+        with _resolve_servers_lock:
+            try:
+                with open(RESOLVE_SERVERS_FILE, "r") as f:
+                    doc = json.load(f)
+            except Exception:
+                doc = {"servers": {}}
+            log = doc.setdefault("log", [])
+            log.append({
+                "ts": int(time.time()),
+                "server_id": server_id,
+                "device_id": device_id or "(rong)",
+                "client_ip": ip,
+            })
+            doc["log"] = log[-50:]
+            tmp = RESOLVE_SERVERS_FILE + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(doc, f, indent=2)
+            os.replace(tmp, RESOLVE_SERVERS_FILE)
+    except Exception as e:
+        app.logger.error(f"[resolve] Khong ghi duoc log lookup: {e}")
+
+
 def _verify_attestation_ticket(ticket_result_b64: str, ticket_signature_b64: str, expected_pkg: str):
     """
     Verify 1 "vé" attestation (payload đã ký từ /api/attestation-verify).
@@ -1070,6 +1136,74 @@ def get_config():
     })
 
 
+@app.route("/api/resolve", methods=["POST"])
+@limiter.limit("10 per minute")   # cung muc voi /api/config vi day cung la du lieu nhay cam (IP that)
+def resolve():
+    """
+    Tra IP that dang sau 1 "server_id" logic (KHONG phai domain DNS cong
+    khai). Dung LAI y het co che xac thuc cua /api/config: token+package,
+    roi device whitelist/blacklist, roi attestation ticket — vi day KHONG
+    phai "giai ma", chi la tra cuu co dieu kien (xem giai thich da trao doi):
+    ai co token/ticket hop le thi server tra IP, khong co buoc toan hoc nao
+    dam bao khong the dao nguoc ca. Do do phai bao ve dau vao (token/ticket)
+    chat che nhu /api/config, khong duoc long leo hon.
+    """
+    data   = request.get_json(force=True, silent=True) or {}
+    token  = data.get("token", "")
+    pkg    = data.get("pkg",   "")
+    server_id = data.get("server_id", "")
+    ticket_result    = data.get("attestation_ticket_result", "")
+    ticket_signature = data.get("attestation_ticket_signature", "")
+    device_id = data.get("device_id", "")
+    ip     = request.remote_addr
+
+    app.logger.info(f"[resolve] {ip} | pkg={pkg} | server_id={server_id} | device_id={device_id or '(rong)'}")
+
+    ok, reason = _check_auth(token, pkg)
+    if not ok:
+        app.logger.warning(f"[resolve] DENIED from {ip}: {reason}")
+        return jsonify({"error": reason}), 403
+
+    if not server_id:
+        return jsonify({"error": "thieu_server_id"}), 400
+
+    if _is_device_whitelisted(device_id):
+        app.logger.info(f"[resolve] BYPASS attestation (whitelisted device_id={device_id}) {ip}")
+    elif _is_device_blacklisted(device_id):
+        app.logger.warning(f"[resolve] DENIED (blacklisted) device_id={device_id} {ip}")
+        return jsonify({"error": "device_blacklisted_root_detected"}), 403
+    else:
+        ticket_ok, ticket_reason, ticket_payload = _verify_attestation_ticket(ticket_result, ticket_signature, pkg)
+        if not ticket_ok:
+            if ticket_reason == "device_not_attested" and ticket_payload is not None:
+                _record_blocked_device(
+                    device_id, ip, pkg,
+                    ticket_payload.get("verified_boot_state"),
+                    ticket_payload.get("device_locked"),
+                    ticket_payload.get("package_ok"),
+                    ticket_payload.get("sig_ok"),
+                )
+            app.logger.warning(f"[resolve] DENIED (attestation) from {ip}: {ticket_reason} | device_id={device_id or '(rong)'}")
+            return jsonify({"error": ticket_reason}), 403
+
+    entry = _get_resolve_server(server_id)
+    if entry is None:
+        # KHONG phan biet "khong ton tai" voi "bi disable" trong response —
+        # tranh lo thong tin cho ke do server_id de tim entry that.
+        app.logger.warning(f"[resolve] server_id khong ton tai/disabled: {server_id} ({ip})")
+        return jsonify({"error": "server_id_not_found"}), 404
+
+    _log_resolve_lookup(server_id, device_id, ip)
+
+    app.logger.info(f"[resolve] served {server_id} -> {entry['ip']} to {ip}")
+    return jsonify({
+        "server_id": server_id,
+        "ip": entry["ip"],
+        "port": entry.get("port"),
+        "expires_in": CACHE_TTL,
+    })
+
+
 @app.route("/api/events", methods=["GET"])
 def events():
     token = request.args.get("token", "")
@@ -1116,6 +1250,7 @@ def health():
     config_set = os.path.exists(CONFIG_DATA_FILE)
     with _sse_lock:
         connected = len(_sse_clients)
+    resolve_servers = _load_resolve_servers()
     return jsonify({
         "status": "ok",
         "token_configured": token_set,
@@ -1125,6 +1260,8 @@ def health():
         "cache_ttl_seconds": CACHE_TTL,
         "github_fetch_ttl_seconds": GITHUB_FETCH_TTL,
         "sse_connections": connected,
+        "resolve_servers_configured": len(resolve_servers),
+        "resolve_servers_enabled": sum(1 for v in resolve_servers.values() if v.get("enabled", True)),
     })
 
 
