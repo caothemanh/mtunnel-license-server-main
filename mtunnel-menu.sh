@@ -20,6 +20,7 @@ ATTESTATION_SIGNING_HASHES_FILE="$INSTALL_DIR/.attestation_signing_hashes.json"
 DEX_HASHES_FILE="$INSTALL_DIR/.dex_hashes.json"
 DEVICE_WHITELIST_FILE="$INSTALL_DIR/.attestation_whitelist.json"
 DEVICE_BLOCKED_FILE="$INSTALL_DIR/.attestation_blocked_devices.json"
+RESOLVE_SERVERS_FILE="$INSTALL_DIR/.resolve_servers.json"
 GITHUB_REPO_FILE="$INSTALL_DIR/.github_repo"
 GITHUB_TOKEN_FILE="$INSTALL_DIR/.github_token"
 APK_UPLOAD_DIR="$INSTALL_DIR/apk_uploads"
@@ -1359,6 +1360,353 @@ update_panel_from_github() {
     exec "$INSTALL_DIR/mtunnel-menu.sh"
 }
 
+list_resolve_servers() {
+    python3 - "$RESOLVE_SERVERS_FILE" << 'PYEOF'
+import sys, json, time
+try:
+    with open(sys.argv[1]) as f:
+        servers = json.load(f).get("servers", {})
+except Exception:
+    servers = {}
+if not servers:
+    print("(chua co server_id nao duoc khai bao)")
+else:
+    items = sorted(servers.items(), key=lambda kv: kv[0])
+    for i, (server_id, info) in enumerate(items, 1):
+        ip = info.get("ip", "?")
+        port = info.get("port", "?")
+        note = info.get("note", "")
+        enabled = info.get("enabled", True)
+        updated_at = info.get("updated_at", 0)
+        updated_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(updated_at)) if updated_at else "?"
+        state = "BAT" if enabled else "TAT"
+        print(f"  {i}) {server_id}  ->  {ip}:{port}  [{state}]")
+        if note:
+            print(f"       ghi_chu={note} | cap_nhat_luc={updated_str}")
+        else:
+            print(f"       cap_nhat_luc={updated_str}")
+PYEOF
+}
+
+save_resolve_server() {
+    local server_id="$1" ip="$2" port="$3" note="$4" enabled="$5"
+    python3 - "$RESOLVE_SERVERS_FILE" "$server_id" "$ip" "$port" "$note" "$enabled" << 'PYEOF'
+import sys, json, os, time
+path, server_id, ip, port, note, enabled = sys.argv[1:7]
+try:
+    with open(path) as f:
+        doc = json.load(f)
+except Exception:
+    doc = {"servers": {}}
+servers = doc.setdefault("servers", {})
+servers[server_id] = {
+    "ip": ip,
+    "port": int(port) if port.isdigit() else 443,
+    "note": note,
+    "enabled": enabled == "1",
+    "updated_at": int(time.time()),
+}
+tmp = path + ".tmp"
+with open(tmp, "w") as f:
+    json.dump(doc, f, indent=2)
+os.replace(tmp, path)
+print("OK")
+PYEOF
+}
+
+toggle_resolve_server_by_index() {
+    local idx="$1"
+    python3 - "$RESOLVE_SERVERS_FILE" "$idx" << 'PYEOF'
+import sys, json, os
+path, idx = sys.argv[1], sys.argv[2]
+try:
+    with open(path) as f:
+        doc = json.load(f)
+except Exception:
+    print("ERROR:file_not_found")
+    sys.exit(1)
+servers = doc.get("servers", {})
+if not servers:
+    print("ERROR:empty")
+    sys.exit(1)
+if not idx.isdigit():
+    print("ERROR:invalid_index")
+    sys.exit(1)
+idx = int(idx)
+items = sorted(servers.items(), key=lambda kv: kv[0])
+if idx < 1 or idx > len(items):
+    print("ERROR:invalid_index")
+    sys.exit(1)
+server_id, info = items[idx - 1]
+info["enabled"] = not info.get("enabled", True)
+tmp = path + ".tmp"
+with open(tmp, "w") as f:
+    json.dump(doc, f, indent=2)
+os.replace(tmp, path)
+print(f"TOGGLED:{server_id}:{'BAT' if info['enabled'] else 'TAT'}")
+PYEOF
+}
+
+preview_resolve_selection() {
+    local idx_csv="$1"
+    python3 - "$RESOLVE_SERVERS_FILE" "$idx_csv" << 'PYEOF'
+import sys, json
+path, idx_csv = sys.argv[1], sys.argv[2]
+try:
+    with open(path) as f:
+        servers = json.load(f).get("servers", {})
+except Exception:
+    servers = {}
+if not servers:
+    print("ERROR:empty")
+    sys.exit(1)
+items = sorted(servers.items(), key=lambda kv: kv[0])
+if idx_csv.strip().lower() == "all":
+    selected = set(range(1, len(items) + 1))
+else:
+    selected = set()
+    for part in idx_csv.replace(" ", ",").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if not part.isdigit():
+            print(f"ERROR:invalid_index:{part}")
+            sys.exit(1)
+        selected.add(int(part))
+invalid = [i for i in selected if i < 1 or i > len(items)]
+if invalid:
+    print(f"ERROR:invalid_index:{','.join(map(str, sorted(invalid)))}")
+    sys.exit(1)
+if not selected:
+    print("ERROR:no_selection")
+    sys.exit(1)
+for i, (server_id, info) in enumerate(items, 1):
+    mark = "[x]" if i in selected else "[ ]"
+    print(f"{mark} {i}) {server_id} -> {info.get('ip', '?')}:{info.get('port', '?')}")
+print(f"COUNT:{len(selected)}")
+PYEOF
+}
+
+clear_resolve_servers_by_indices() {
+    local idx_csv="$1"
+    python3 - "$RESOLVE_SERVERS_FILE" "$idx_csv" << 'PYEOF'
+import sys, json, os
+path, idx_csv = sys.argv[1], sys.argv[2]
+try:
+    with open(path) as f:
+        doc = json.load(f)
+except Exception:
+    print("ERROR:file_not_found")
+    sys.exit(1)
+servers = doc.get("servers", {})
+items = sorted(servers.items(), key=lambda kv: kv[0])
+if idx_csv.strip().lower() == "all":
+    indices = set(range(1, len(items) + 1))
+else:
+    indices = set()
+    for part in idx_csv.replace(" ", ",").split(","):
+        part = part.strip()
+        if part:
+            indices.add(int(part))
+invalid = [i for i in indices if i < 1 or i > len(items)]
+if invalid:
+    print(f"ERROR:invalid_index:{','.join(map(str, sorted(invalid)))}")
+    sys.exit(1)
+if not indices:
+    print("ERROR:no_selection")
+    sys.exit(1)
+removed = []
+for i in indices:
+    server_id = items[i - 1][0]
+    removed.append(server_id)
+    servers.pop(server_id, None)
+tmp = path + ".tmp"
+with open(tmp, "w") as f:
+    json.dump(doc, f, indent=2)
+os.replace(tmp, path)
+print("REMOVED:" + "|".join(removed))
+print(f"COUNT:{len(removed)}")
+PYEOF
+}
+
+view_resolve_lookup_log() {
+    python3 - "$RESOLVE_SERVERS_FILE" << 'PYEOF'
+import sys, json, time
+try:
+    with open(sys.argv[1]) as f:
+        log = json.load(f).get("log", [])
+except Exception:
+    log = []
+if not log:
+    print("(chua co lan goi /api/resolve nao duoc ghi log)")
+else:
+    for entry in reversed(log[-50:]):
+        ts = entry.get("ts", 0)
+        ts_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts)) if ts else "?"
+        print(f"  {ts_str}  server_id={entry.get('server_id', '?')}  "
+              f"device_id={entry.get('device_id', '?')}  ip_nguon={entry.get('client_ip', '?')}")
+PYEOF
+}
+
+dns_resolve_menu() {
+    while true; do
+        show_submenu_header "🌐 QUẢN LÝ DNS ẢO (/api/resolve — server_id -> IP thật)"
+        echo -e "${YELLOW}Đây là bảng ánh xạ server_id (KHÔNG phải domain DNS công khai)${NC}"
+        echo -e "${YELLOW}sang IP thật phía sau (VPS chạy SSH/V2Ray/Psiphon). Bảng này${NC}"
+        echo -e "${YELLOW}KHÔNG bao giờ được đưa vào DNS zone/Cloudflare — chỉ lộ ra qua${NC}"
+        echo -e "${YELLOW}/api/resolve sau khi app verify token+attestation. App phía${NC}"
+        echo -e "${YELLOW}client gọi tới đây khi gặp 1 chuỗi domain KHÔNG resolve được${NC}"
+        echo -e "${YELLOW}qua DNS công khai thật (xem HiddenDomainResolver.java).${NC}"
+        echo ""
+        list_resolve_servers
+        echo ""
+        echo -e "  ${CYAN}[1]${NC}  ${YELLOW}THÊM SERVER_ID MỚI${NC}"
+        echo -e "  ${CYAN}[2]${NC}  ${YELLOW}SỬA 1 MỤC (IP/PORT/GHI CHÚ)${NC}"
+        echo -e "  ${CYAN}[3]${NC}  ${YELLOW}BẬT/TẮT 1 MỤC${NC} (tắt = rút IP khỏi lưu hành ngay, không cần xoá hẳn)"
+        echo -e "  ${CYAN}[4]${NC}  ${YELLOW}XÓA (CÓ THỂ CHỌN NHIỀU)${NC}"
+        echo -e "  ${CYAN}[5]${NC}  ${YELLOW}XEM LOG TRA CỨU GẦN ĐÂY${NC} (ai đã gọi /api/resolve cho server_id nào)"
+        echo -e "  ${CYAN}[6]${NC}  ${WHITE}QUAY LẠI${NC}"
+        echo ""
+        read -p "Chon [1-6]: " DNS_CHOICE
+        echo ""
+        case "$DNS_CHOICE" in
+            1)
+                read -p "server_id (vd: mx.mpsi.io.vn, chinh la gia tri dat trong meekFrontingAddresses/ServerIP): " DNS_SID
+                if [ -z "$DNS_SID" ]; then
+                    echo -e "${YELLOW}Da huy.${NC}"
+                else
+                    read -p "IP that phia sau (vd: 103.173.66.47): " DNS_IP
+                    if ! [[ "$DNS_IP" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+                        echo -e "${RED}IP khong hop le.${NC}"
+                    else
+                        read -p "Port (Enter = 443): " DNS_PORT
+                        DNS_PORT=${DNS_PORT:-443}
+                        read -p "Ghi chu (Enter = bo trong): " DNS_NOTE
+                        save_resolve_server "$DNS_SID" "$DNS_IP" "$DNS_PORT" "$DNS_NOTE" "1" > /dev/null
+                        chmod 600 "$RESOLVE_SERVERS_FILE" 2>/dev/null || true
+                        chown www-data:www-data "$RESOLVE_SERVERS_FILE" 2>/dev/null || true
+                        echo -e "${GREEN}✅ Da them/cap nhat $DNS_SID -> $DNS_IP:$DNS_PORT${NC}"
+                    fi
+                fi
+                ;;
+            2)
+                read -p "Nhap so thu tu muon sua (Enter de huy): " DNS_IDX
+                if [ -n "$DNS_IDX" ] && [[ "$DNS_IDX" =~ ^[0-9]+$ ]]; then
+                    DNS_CURRENT=$(python3 - "$RESOLVE_SERVERS_FILE" "$DNS_IDX" << 'PYEOF'
+import sys, json
+path, idx = sys.argv[1], sys.argv[2]
+try:
+    with open(path) as f:
+        servers = json.load(f).get("servers", {})
+except Exception:
+    servers = {}
+items = sorted(servers.items(), key=lambda kv: kv[0])
+idx = int(idx)
+if idx < 1 or idx > len(items):
+    print("")
+else:
+    sid, info = items[idx - 1]
+    print(f"{sid}|{info.get('ip', '')}|{info.get('port', 443)}|{info.get('note', '')}")
+PYEOF
+)
+                    if [ -z "$DNS_CURRENT" ]; then
+                        echo -e "${RED}So thu tu khong hop le.${NC}"
+                    else
+                        DNS_SID=$(echo "$DNS_CURRENT" | cut -d'|' -f1)
+                        DNS_OLD_IP=$(echo "$DNS_CURRENT" | cut -d'|' -f2)
+                        DNS_OLD_PORT=$(echo "$DNS_CURRENT" | cut -d'|' -f3)
+                        DNS_OLD_NOTE=$(echo "$DNS_CURRENT" | cut -d'|' -f4)
+                        echo -e "${YELLOW}Dang sua: $DNS_SID (hien tai: $DNS_OLD_IP:$DNS_OLD_PORT, ghi_chu=\"$DNS_OLD_NOTE\")${NC}"
+                        read -p "IP moi (Enter = giu nguyen $DNS_OLD_IP): " DNS_IP
+                        DNS_IP=${DNS_IP:-$DNS_OLD_IP}
+                        read -p "Port moi (Enter = giu nguyen $DNS_OLD_PORT): " DNS_PORT
+                        DNS_PORT=${DNS_PORT:-$DNS_OLD_PORT}
+                        read -p "Ghi chu moi (Enter = giu nguyen): " DNS_NOTE
+                        DNS_NOTE=${DNS_NOTE:-$DNS_OLD_NOTE}
+                        if ! [[ "$DNS_IP" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+                            echo -e "${RED}IP khong hop le.${NC}"
+                        else
+                            save_resolve_server "$DNS_SID" "$DNS_IP" "$DNS_PORT" "$DNS_NOTE" "1" > /dev/null
+                            chmod 600 "$RESOLVE_SERVERS_FILE" 2>/dev/null || true
+                            chown www-data:www-data "$RESOLVE_SERVERS_FILE" 2>/dev/null || true
+                            echo -e "${GREEN}✅ Da cap nhat $DNS_SID -> $DNS_IP:$DNS_PORT${NC}"
+                        fi
+                    fi
+                elif [ -n "$DNS_IDX" ]; then
+                    echo -e "${RED}So thu tu khong hop le.${NC}"
+                fi
+                ;;
+            3)
+                read -p "Nhap so thu tu muon bat/tat (Enter de huy): " DNS_IDX
+                if [ -n "$DNS_IDX" ] && [[ "$DNS_IDX" =~ ^[0-9]+$ ]]; then
+                    DNS_RESULT=$(toggle_resolve_server_by_index "$DNS_IDX")
+                    chmod 600 "$RESOLVE_SERVERS_FILE" 2>/dev/null || true
+                    chown www-data:www-data "$RESOLVE_SERVERS_FILE" 2>/dev/null || true
+                    case "$DNS_RESULT" in
+                        TOGGLED:*)
+                            DNS_SID=$(echo "$DNS_RESULT" | cut -d: -f2)
+                            DNS_STATE=$(echo "$DNS_RESULT" | cut -d: -f3)
+                            echo -e "${GREEN}✅ $DNS_SID gio la [$DNS_STATE].${NC}"
+                            ;;
+                        *)
+                            echo -e "${RED}Loi: $DNS_RESULT${NC}"
+                            ;;
+                    esac
+                elif [ -n "$DNS_IDX" ]; then
+                    echo -e "${RED}So thu tu khong hop le.${NC}"
+                fi
+                ;;
+            4)
+                echo -e "${YELLOW}Nhap cac so muon xoa, cach nhau boi dau phay hoac khoang trang (vd: 1,3,5).${NC}"
+                echo -e "${YELLOW}Go 'all' de xoa tat ca. Enter de huy.${NC}"
+                read -p "Chon: " DNS_IDX
+                if [ -n "$DNS_IDX" ]; then
+                    DNS_PREVIEW=$(preview_resolve_selection "$DNS_IDX")
+                    if [[ "$DNS_PREVIEW" == ERROR:empty* ]]; then
+                        echo -e "${RED}Danh sach dang trong.${NC}"
+                    elif [[ "$DNS_PREVIEW" == ERROR:invalid_index* ]]; then
+                        echo -e "${RED}So thu tu khong hop le: ${DNS_PREVIEW#ERROR:invalid_index:}${NC}"
+                    elif [[ "$DNS_PREVIEW" == ERROR:no_selection* ]]; then
+                        echo -e "${RED}Chua chon muc nao.${NC}"
+                    else
+                        echo ""
+                        echo -e "${CYAN}${BOLD}Danh sach da chon xoa:${NC}"
+                        echo "$DNS_PREVIEW" | grep -v "^COUNT:"
+                        DNS_SEL_COUNT=$(echo "$DNS_PREVIEW" | grep "^COUNT:" | cut -d: -f2)
+                        echo ""
+                        read -p "Xac nhan xoa $DNS_SEL_COUNT muc da chon? [y/N]: " DNS_CONFIRM
+                        if [[ "$DNS_CONFIRM" == "y" || "$DNS_CONFIRM" == "Y" ]]; then
+                            DNS_RM_RESULT=$(clear_resolve_servers_by_indices "$DNS_IDX")
+                            chmod 600 "$RESOLVE_SERVERS_FILE" 2>/dev/null || true
+                            chown www-data:www-data "$RESOLVE_SERVERS_FILE" 2>/dev/null || true
+                            if [[ "$DNS_RM_RESULT" == *"REMOVED:"* ]]; then
+                                DNS_RM_COUNT=$(echo "$DNS_RM_RESULT" | grep "^COUNT:" | cut -d: -f2)
+                                echo -e "${GREEN}✅ Da xoa $DNS_RM_COUNT muc.${NC}"
+                            else
+                                echo -e "${RED}Loi: $DNS_RM_RESULT${NC}"
+                            fi
+                        else
+                            echo -e "${YELLOW}Da huy.${NC}"
+                        fi
+                    fi
+                fi
+                ;;
+            5)
+                echo -e "${CYAN}${BOLD}50 lan tra cuu /api/resolve gan nhat:${NC}"
+                echo ""
+                view_resolve_lookup_log
+                ;;
+            6)
+                return
+                ;;
+            *)
+                echo -e "${RED}Lua chon khong hop le.${NC}"
+                ;;
+        esac
+        echo ""
+    done
+}
+
 uninstall_all() {
     echo -e "${RED}${BOLD}GỠ CÀI ĐẶT MTUNNEL LICENSE SERVER${NC}"
     echo -e "${BLUE}─────────────────────────────────────────────────${NC}"
@@ -1425,12 +1773,13 @@ while true; do
     echo -e "  ${CYAN}[9]${NC}  ${YELLOW}QUẢN LÝ SIGNING + DEX HASH ALLOW-LIST${NC} (chống resign & patch APK)"
     echo -e "  ${CYAN}[10]${NC} ${YELLOW}CẤU HÌNH GITHUB CHO /API/CONFIG${NC} (owner/repo/branch/path/token)"
     echo -e "  ${CYAN}[11]${NC} ${YELLOW}ĐỔI PORT HTTPS${NC}"
+    echo -e "  ${CYAN}[12]${NC} ${YELLOW}QUẢN LÝ DNS ẢO${NC} (bảng server_id -> IP thật cho /api/resolve)"
     echo -e "${BLUE}  ─────────────────────────────────────────────────${NC}"
-    echo -e "  ${CYAN}[12]${NC} ${YELLOW}CẬP NHẬT PANEL TỪ GITHUB${NC} (bản mới nhất)"
-    echo -e "  ${CYAN}[13]${NC} ${RED}GỠ CÀI ĐẶT${NC} (xoá toàn bộ MTunnel License Server)"
-    echo -e "  ${CYAN}[14]${NC} ${WHITE}THOÁT${NC}"
+    echo -e "  ${CYAN}[13]${NC} ${YELLOW}CẬP NHẬT PANEL TỪ GITHUB${NC} (bản mới nhất)"
+    echo -e "  ${CYAN}[14]${NC} ${RED}GỠ CÀI ĐẶT${NC} (xoá toàn bộ MTunnel License Server)"
+    echo -e "  ${CYAN}[15]${NC} ${WHITE}THOÁT${NC}"
     echo ""
-    read -p "Nhap lua chon [1-14]: " CHOICE
+    read -p "Nhap lua chon [1-15]: " CHOICE
     echo ""
 
     case "$CHOICE" in
@@ -1499,12 +1848,15 @@ while true; do
             change_port_menu
             ;;
         12)
-            update_panel_from_github
+            dns_resolve_menu
             ;;
         13)
-            uninstall_all
+            update_panel_from_github
             ;;
         14)
+            uninstall_all
+            ;;
+        15)
             echo "Tam biet."
             exit 0
             ;;
