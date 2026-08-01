@@ -767,6 +767,12 @@ def attestation_verify():
     pkg = data.get("pkg", "")
     challenge_b64 = data.get("challenge", "")
     cert_chain_b64 = data.get("cert_chain", [])
+    # FIX (replay ticket giữa nhiều máy): device_id gửi kèm ở đây được nhúng
+    # thẳng vào result_payload bên dưới rồi ký cùng — không phải field client
+    # tự khai được dùng sau này để "match", mà là 1 phần payload ĐÃ KÝ. Muốn
+    # đổi device_id trong vé, phải giả mạo chữ ký Ed25519 của SIGNING_KEY —
+    # không làm được nếu không có private key server.
+    device_id = data.get("device_id", "")
     ip = request.remote_addr
 
     ok, reason = _check_auth(token, pkg)
@@ -849,6 +855,7 @@ def attestation_verify():
     result_payload = {
         "valid": is_valid,
         "pkg": pkg,
+        "device_id": device_id,
         "verified_boot_state": parsed["verified_boot_state"],
         "device_locked": parsed["device_locked"],
         "package_ok": package_ok,
@@ -860,7 +867,7 @@ def attestation_verify():
     signature = SIGNING_KEY.sign(message)
 
     if is_valid:
-        app.logger.info(f"[attestation-verify] OK {ip} | pkg={pkg}")
+        app.logger.info(f"[attestation-verify] OK {ip} | pkg={pkg} | device_id={device_id or '(rong)'}")
     else:
         app.logger.warning(
             f"[attestation-verify] NOT_VERIFIED {ip} | pkg={pkg} | "
@@ -1139,13 +1146,26 @@ def _log_resolve_lookup(server_id: str, device_id: str, ip: str):
         app.logger.error(f"[resolve] Khong ghi duoc log lookup: {e}")
 
 
-def _verify_attestation_ticket(ticket_result_b64: str, ticket_signature_b64: str, expected_pkg: str):
+def _verify_attestation_ticket(ticket_result_b64: str, ticket_signature_b64: str, expected_pkg: str,
+                                expected_device_id: str = ""):
     """
     Verify 1 "vé" attestation (payload đã ký từ /api/attestation-verify).
     Trả về (True, None, payload) nếu vé hợp lệ VÀ thiết bị đã attest thành
     công (payload["valid"]==True), ngược lại (False, reason, payload).
     payload chỉ có giá trị (khác None) khi đã giải mã JSON thành công —
     dùng để ghi lại lý do bị chặn (root/bootloader mở khóa) khi cần.
+
+    FIX (lỗ hổng replay ticket giữa nhiều máy): trước bản vá này, payload
+    chỉ gắn với "pkg" + "ts" (TTL = ATTESTATION_TICKET_MAX_AGE = 3 NGÀY).
+    Một vé mint hợp lệ từ 1 máy sạch (bootloader khoá, không root) là chữ
+    ký hợp lệ vĩnh viễn trong 3 ngày CHO BẤT KỲ REQUEST NÀO có cùng pkg —
+    copy được sang máy khác (kể cả máy đã root/mở khoá bootloader) và vẫn
+    được /api/config, /api/resolve chấp nhận, vì không có gì trong payload
+    xác định NÓ THUỘC VỀ MÁY NÀO. Đây chính xác là cách 1 nhóm chia sẻ 1
+    vé để dùng chung trên nhiều máy đã bị mở khoá bootloader (ảnh chụp màn
+    hình group send cho anh Cipo). Nay bắt buộc device_id nhúng trong vé
+    (được ký, không giả mạo được) phải khớp device_id gửi kèm request hiện
+    tại — vé mint trên máy A không còn dùng được trên máy B nữa.
     """
     if not ticket_result_b64 or not ticket_signature_b64:
         return False, "thieu_attestation_ticket", None
@@ -1170,6 +1190,17 @@ def _verify_attestation_ticket(ticket_result_b64: str, ticket_signature_b64: str
 
     if payload.get("pkg") != expected_pkg:
         return False, "ticket_sai_package", payload
+
+    # KHÔNG được bỏ qua check khi 1 trong 2 bên rỗng — nếu làm vậy, 1 client
+    # sửa app để gửi device_id="" lúc mint (và cũng gửi "" lúc dùng vé) sẽ
+    # lách được toàn bộ phần vá này, dựng lại đúng lỗ hổng replay ban đầu.
+    # So sánh CHẶT tuyệt đối: thiếu device_id ở BẤT KỲ đâu (payload cũ mint
+    # trước khi vá, hoặc app client chưa build lại) đều bị coi là không
+    # khớp và từ chối — chấp nhận việc vé cũ hết dùng được ngay sau khi
+    # deploy bản vá này, thay vì để hở đường lách.
+    ticket_device_id = payload.get("device_id", "")
+    if ticket_device_id != expected_device_id:
+        return False, "ticket_sai_device_id", payload
 
     ticket_age = time.time() - payload.get("ts", 0)
     if ticket_age > ATTESTATION_TICKET_MAX_AGE or ticket_age < -10:
@@ -1213,7 +1244,8 @@ def get_config():
         # Config chỉ được trả nếu kèm 1 vé Key Attestation còn hạn, đúng pkg,
         # và server tự verify chữ ký (KHÔNG tin app tự khai báo gì cả) — đây
         # mới là điểm ép buộc thật, không phải 1 check nằm rời rạc trong app.
-        ticket_ok, ticket_reason, ticket_payload = _verify_attestation_ticket(ticket_result, ticket_signature, pkg)
+        ticket_ok, ticket_reason, ticket_payload = _verify_attestation_ticket(
+            ticket_result, ticket_signature, pkg, device_id)
         if not ticket_ok:
             if ticket_reason == "device_not_attested" and ticket_payload is not None:
                 # Ve ky hop le, server DA verify duoc Key Attestation that,
@@ -1282,7 +1314,8 @@ def resolve():
         app.logger.warning(f"[resolve] DENIED (blacklisted) device_id={device_id} {ip}")
         return jsonify({"error": "device_blacklisted_root_detected"}), 403
     else:
-        ticket_ok, ticket_reason, ticket_payload = _verify_attestation_ticket(ticket_result, ticket_signature, pkg)
+        ticket_ok, ticket_reason, ticket_payload = _verify_attestation_ticket(
+            ticket_result, ticket_signature, pkg, device_id)
         if not ticket_ok:
             if ticket_reason == "device_not_attested" and ticket_payload is not None:
                 _record_blocked_device(
