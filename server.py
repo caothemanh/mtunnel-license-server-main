@@ -2,7 +2,7 @@
 from flask import Flask, request, jsonify, Response, stream_with_context
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
-import logging, os, time, json, queue, threading, base64, hmac, hashlib, urllib.request, urllib.error
+import logging, os, time, json, queue, threading, base64, hmac, hashlib, secrets, urllib.request, urllib.error
 
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from cryptography.hazmat.primitives import serialization
@@ -47,6 +47,17 @@ DEVICE_BLOCKED_FILE = os.path.join(INSTALL_DIR, ".attestation_blocked_devices.js
 #                                  "enabled": true, "updated_at": <epoch>}}}
 RESOLVE_SERVERS_FILE = os.path.join(INSTALL_DIR, ".resolve_servers.json")
 _resolve_servers_lock = threading.Lock()
+# Bảng token RIÊNG cho từng device_id — ngẫu nhiên thật (secrets.token_hex),
+# KHÔNG tính lại được từ APK như cachedPass (khác hẳn cachedPass, vốn ai có
+# file APK cũng tự tính lại y hệt được bằng apksigner/keytool — không phải
+# bí mật thật, chỉ là "định danh bản build"). Chỉ được CẤP (issue) sau khi
+# device đã tự chứng minh bằng vé Key Attestation THẬT (hardware-backed,
+# không giả mạo được) tại /api/config hoặc /api/resolve — không bao giờ cấp
+# chỉ dựa vào device_id tự khai suông. Format:
+#   {"devices": {"<device_id>": {"token": "<hex64>", "pkg": "...",
+#                                  "issued_at": <epoch>, "last_seen": <epoch>}}}
+DEVICE_TOKENS_FILE = os.path.join(INSTALL_DIR, ".device_tokens.json")
+_device_tokens_lock = threading.Lock()
 # Whitelist SHA-256 (hex) của chữ ký ký APK thật (bản build gốc, có thể có
 # nhiều giá trị khi đang rollout key mới) — xem compute_signing_hash.py.
 # Đây là "nguồn sự thật" độc lập với _check_auth()/token, vì giá trị được
@@ -137,6 +148,15 @@ def _watch_token():
             if current and current != _last_token:
                 app.logger.info(f"[watcher] token changed -> pushing revoke to all clients")
                 _last_token = current
+                # QUAN TRỌNG: xoá luôn bảng device_token — nếu không, các máy
+                # đã được cấp device_token riêng (không tính lại được từ APK)
+                # sẽ KHÔNG bị ảnh hưởng bởi việc đổi token tĩnh, phá vỡ đúng
+                # tính năng "đổi token = thu hồi TẤT CẢ ngay lập tức" mà admin
+                # đang trông cậy vào (vd khi APK bị lộ/crack). Buộc mọi máy
+                # phải bootstrap lại bằng token tĩnh mới + vé attestation thật
+                # để được cấp device_token mới.
+                _clear_all_device_tokens()
+                app.logger.info(f"[watcher] da xoa toan bo device_token dang cap")
                 _sse_push_all("revoke")
         except Exception as e:
             app.logger.error(f"[watcher] error: {e}")
@@ -157,26 +177,136 @@ def _get_package():
     except:
         return ""
 
-def _check_auth(token, pkg):
+
+def _load_device_tokens():
+    try:
+        with open(DEVICE_TOKENS_FILE, "r") as f:
+            return json.load(f).get("devices", {})
+    except Exception:
+        return {}
+
+
+def _write_device_tokens(devices):
+    with _device_tokens_lock:
+        tmp = DEVICE_TOKENS_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump({"devices": devices}, f, indent=2)
+        os.replace(tmp, DEVICE_TOKENS_FILE)
+
+
+def _check_device_token(device_id, token):
+    """So token gui len voi token da cap RIENG cho device_id nay."""
+    if not device_id or not token:
+        return False
+    record = _load_device_tokens().get(device_id)
+    if not record:
+        return False
+    return hmac.compare_digest(token, record.get("token", ""))
+
+
+def _check_device_token_any(token):
     """
-    REVERT về logic gốc: 1 token duy nhất do admin đặt qua 'mtunnel-token'
-    (chính là cachedPass — tính từ chữ ký APK thật, admin tự nhập 1 lần từ
-    bản build gốc). Token này KHÔNG tự cấp/thay đổi được từ phía app —
-    chỉ admin đổi được qua menu quản lý, nên nếu app bị inject/resign lại
-    (chữ ký đổi → cachedPass tính ra khác) sẽ KHÔNG khớp token admin đã
-    đặt, dù attacker có vô hiệu hóa mọi check nội bộ trong app (vd bằng
-    MT Manager "Kill Signature Verification") — quyết định nằm ở SERVER,
-    không phải ở app, nên không patch app để bypass được.
+    Fallback cho cac route KHONG gui device_id kem theo (vd
+    /api/attestation-challenge, /api/dex-challenge, /api/dex-verify,
+    /api/verify — cac route nay it nhay cam hon /api/config, /api/resolve
+    nen chua can sua client de gui them device_id). Quet toan bo bang token
+    da cap — so luong thiet bi cua 1 VPN ca nhan luon nho nen chi phi O(n)
+    khong dang ke.
     """
-    valid_token = _read_token()
+    if not token:
+        return False
+    for record in _load_device_tokens().values():
+        if hmac.compare_digest(token, record.get("token", "")):
+            return True
+    return False
+
+
+def _issue_device_token(device_id, pkg):
+    """
+    Cap (hoac lam moi) 1 token ngau nhien THAT rieng cho device_id — CHI goi
+    ham nay SAU KHI device_id da duoc xac thuc bang ve Key Attestation that
+    (tai /api/config hoac /api/resolve), khong bao gio cap chi dua vao
+    device_id tu client tu khai.
+    """
+    devices = _load_device_tokens()
+    new_token = secrets.token_hex(32)
+    existing = devices.get(device_id, {})
+    devices[device_id] = {
+        "token": new_token,
+        "pkg": pkg,
+        "issued_at": existing.get("issued_at", int(time.time())),
+        "last_seen": int(time.time()),
+    }
+    _write_device_tokens(devices)
+    return new_token
+
+
+def _touch_device_token(device_id):
+    """Cap nhat last_seen ma KHONG doi token — dung khi device_token cu van con hop le."""
+    if not device_id:
+        return
+    devices = _load_device_tokens()
+    if device_id in devices:
+        devices[device_id]["last_seen"] = int(time.time())
+        _write_device_tokens(devices)
+
+
+def _clear_all_device_tokens():
+    """
+    Goi khi admin doi TOKEN TINH (mtunnel-token) — xem _watch_token(): doi
+    token tinh von la co che "thu hoi toan bo NGAY LAP TUC" (vd APK bi lo/
+    crack). Neu device_token rieng khong bi xoa cung, may da duoc cap
+    device_token truoc do se KHONG bi anh huong boi viec doi token tinh —
+    pha vo dung "thu hoi toan bo ngay lap tuc" ma tinh nang do dang dam bao.
+    """
+    _write_device_tokens({})
+
+
+def _check_auth(token, pkg, device_id=""):
+    """
+    Chấp nhận 2 loại token:
+      1. Token TĨNH — 1 giá trị duy nhất admin đặt qua 'mtunnel-token' (chính
+         là cachedPass, tính từ chữ ký APK thật). Dùng cho LẦN ĐẦU tiếp xúc
+         (bootstrap) hoặc khi device_token riêng đã bị thu hồi/chưa cấp. Nếu
+         app bị inject/resign lại (chữ ký đổi -> cachedPass tính ra khác) sẽ
+         KHÔNG khớp token admin đã đặt — quyết định nằm ở SERVER, không phải
+         ở app, nên không patch app để bypass được.
+      2. Token RIÊNG cho device_id (device_token) — ngẫu nhiên thật do
+         server tự cấp SAU KHI verify được vé Key Attestation thật (xem
+         _issue_device_token trong /api/config, /api/resolve). KHÔNG tính
+         lại được từ APK — mạnh hơn cachedPass vì kể cả khi APK/cachedPass
+         bị lộ, attacker vẫn không tự cấp được device_token cho 1 device_id
+         chưa từng qua attestation thật.
+
+    Trả về (ok, reason, auth_method) — auth_method in {"device_token",
+    "static_token", None}. Route gọi hàm này (chỉ /api/config, /api/resolve)
+    dùng auth_method để quyết định có cần (re)issue device_token mới hay
+    không: chỉ issue khi auth_method != "device_token" (tức là lần này vẫn
+    đang xác thực bằng token tĩnh — có thể là lần đầu, hoặc token riêng cũ
+    đã bị revoke/xoá).
+    """
     valid_package = _get_package()
-    if not valid_token:
-        return False, "server_not_configured"
     if pkg != valid_package:
-        return False, "wrong_package"
-    if not hmac.compare_digest(token, valid_token):
-        return False, "invalid_token"
-    return True, None
+        return False, "wrong_package", None
+
+    if device_id and _check_device_token(device_id, token):
+        _touch_device_token(device_id)
+        return True, None, "device_token"
+
+    valid_token = _read_token()
+    if not valid_token:
+        return False, "server_not_configured", None
+
+    if hmac.compare_digest(token, valid_token):
+        return True, None, "static_token"
+
+    # Route KHÔNG gửi device_id (attestation-challenge/dex-challenge/
+    # dex-verify/verify) vẫn cần chấp nhận device_token hợp lệ — quét toàn
+    # bộ bảng vì không có device_id để tra trực tiếp.
+    if not device_id and _check_device_token_any(token):
+        return True, None, "device_token"
+
+    return False, "invalid_token", None
 
 def _get_github_settings():
     settings = {}
@@ -316,7 +446,7 @@ def verify():
 
     app.logger.info(f"[verify] {ip} | pkg={pkg} | token={token[:8]}...")
 
-    ok, reason = _check_auth(token, pkg)
+    ok, reason, _auth_method = _check_auth(token, pkg)
     if not ok:
         app.logger.warning(f"[verify] FAILED from {ip}: {reason}")
         return jsonify({"valid": False, "reason": reason})
@@ -740,7 +870,7 @@ def attestation_challenge():
     pkg = data.get("pkg", "")
     ip = request.remote_addr
 
-    ok, reason = _check_auth(token, pkg)
+    ok, reason, _auth_method = _check_auth(token, pkg)
     if not ok:
         app.logger.warning(f"[attestation-challenge] DENIED {ip}: {reason}")
         return jsonify({"error": reason}), 403
@@ -775,7 +905,7 @@ def attestation_verify():
     device_id = data.get("device_id", "")
     ip = request.remote_addr
 
-    ok, reason = _check_auth(token, pkg)
+    ok, reason, _auth_method = _check_auth(token, pkg, device_id)
     if not ok:
         app.logger.warning(f"[attestation-verify] AUTH FAILED {ip}: {reason}")
         return jsonify({"valid": False, "reason": reason})
@@ -892,7 +1022,7 @@ def dex_challenge():
     pkg = data.get("pkg", "")
     ip = request.remote_addr
 
-    ok, reason = _check_auth(token, pkg)
+    ok, reason, _auth_method = _check_auth(token, pkg)
     if not ok:
         app.logger.warning(f"[dex-challenge] DENIED {ip}: {reason}")
         return jsonify({"error": reason}), 403
@@ -931,7 +1061,7 @@ def dex_verify():
     dex_hash = data.get("dex_hash", "").strip().lower()
     ip = request.remote_addr
 
-    ok, reason = _check_auth(token, pkg)
+    ok, reason, _auth_method = _check_auth(token, pkg)
     if not ok:
         app.logger.warning(f"[dex-verify] AUTH FAILED {ip}: {reason}")
         return jsonify({"error": reason}), 403
@@ -1225,7 +1355,7 @@ def get_config():
 
     app.logger.info(f"[config] {ip} | pkg={pkg} | token={token[:8]}... | device_id={device_id or '(rong)'}")
 
-    ok, reason = _check_auth(token, pkg)
+    ok, reason, auth_method = _check_auth(token, pkg, device_id)
     if not ok:
         app.logger.warning(f"[config] DENIED from {ip}: {reason}")
         return jsonify({"error": reason}), 403
@@ -1270,11 +1400,22 @@ def get_config():
 
     signature = SIGNING_KEY.sign(config_bytes)
 
-    app.logger.info(f"[config] served to {ip} | size={len(config_bytes)} bytes")
-    return jsonify({
+    response = {
         "data": base64.b64encode(config_bytes).decode(),
         "signature": base64.b64encode(signature).decode()
-    })
+    }
+
+    # Cấp/refresh device_token RIÊNG cho device_id này — chỉ khi request vừa
+    # xác thực xong bằng token TĨNH (auth_method != "device_token"), tức là
+    # device chưa có token riêng hoặc token riêng cũ đã bị thu hồi. Đã qua
+    # được whitelist HOẶC vé Key Attestation thật ở trên rồi mới tới đây, nên
+    # việc cấp token ở bước này là AN TOÀN (không cấp chỉ dựa vào device_id
+    # tự khai suông).
+    if device_id and auth_method != "device_token":
+        response["new_token"] = _issue_device_token(device_id, pkg)
+
+    app.logger.info(f"[config] served to {ip} | size={len(config_bytes)} bytes")
+    return jsonify(response)
 
 
 @app.route("/api/resolve", methods=["POST"])
@@ -1300,7 +1441,7 @@ def resolve():
 
     app.logger.info(f"[resolve] {ip} | pkg={pkg} | server_id={server_id} | device_id={device_id or '(rong)'}")
 
-    ok, reason = _check_auth(token, pkg)
+    ok, reason, auth_method = _check_auth(token, pkg, device_id)
     if not ok:
         app.logger.warning(f"[resolve] DENIED from {ip}: {reason}")
         return jsonify({"error": reason}), 403
@@ -1337,13 +1478,21 @@ def resolve():
 
     _log_resolve_lookup(server_id, device_id, ip)
 
-    app.logger.info(f"[resolve] served {server_id} -> {entry['ip']} to {ip}")
-    return jsonify({
+    response = {
         "server_id": server_id,
         "ip": entry["ip"],
         "port": entry.get("port"),
         "expires_in": CACHE_TTL,
-    })
+    }
+
+    # Cấp/refresh device_token — cùng logic với /api/config (xem giải thích
+    # ở đó). /api/resolve và /api/config đều có thể là nơi cấp token đầu
+    # tiên, tuỳ app gọi cái nào trước lúc mở tunnel.
+    if device_id and auth_method != "device_token":
+        response["new_token"] = _issue_device_token(device_id, pkg)
+
+    app.logger.info(f"[resolve] served {server_id} -> {entry['ip']} to {ip}")
+    return jsonify(response)
 
 
 @app.route("/api/events", methods=["GET"])
@@ -1352,7 +1501,7 @@ def events():
     pkg   = request.args.get("pkg",   "")
     ip    = request.remote_addr
 
-    ok, reason = _check_auth(token, pkg)
+    ok, reason, _auth_method = _check_auth(token, pkg)
     if not ok:
         app.logger.warning(f"[events] reject {ip}: {reason}")
         status = 503 if reason == "server_not_configured" else 401

@@ -21,6 +21,7 @@ DEX_HASHES_FILE="$INSTALL_DIR/.dex_hashes.json"
 DEVICE_WHITELIST_FILE="$INSTALL_DIR/.attestation_whitelist.json"
 DEVICE_BLOCKED_FILE="$INSTALL_DIR/.attestation_blocked_devices.json"
 RESOLVE_SERVERS_FILE="$INSTALL_DIR/.resolve_servers.json"
+DEVICE_TOKENS_FILE="$INSTALL_DIR/.device_tokens.json"
 GITHUB_REPO_FILE="$INSTALL_DIR/.github_repo"
 GITHUB_TOKEN_FILE="$INSTALL_DIR/.github_token"
 APK_UPLOAD_DIR="$INSTALL_DIR/apk_uploads"
@@ -1707,6 +1708,180 @@ PYEOF
     done
 }
 
+list_device_tokens() {
+    python3 - "$DEVICE_TOKENS_FILE" << 'PYEOF'
+import sys, json, time
+try:
+    with open(sys.argv[1]) as f:
+        devices = json.load(f).get("devices", {})
+except Exception:
+    devices = {}
+if not devices:
+    print("(chua co device_token nao duoc cap)")
+else:
+    items = sorted(devices.items(), key=lambda kv: kv[1].get("last_seen", 0), reverse=True)
+    for i, (device_id, info) in enumerate(items, 1):
+        token = info.get("token", "")
+        masked = (token[:8] + "..." + token[-4:]) if len(token) > 12 else token
+        pkg = info.get("pkg", "?")
+        issued_at = info.get("issued_at", 0)
+        last_seen = info.get("last_seen", 0)
+        issued_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(issued_at)) if issued_at else "?"
+        last_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(last_seen)) if last_seen else "?"
+        print(f"  {i}) device_id={device_id}")
+        print(f"       token={masked} | pkg={pkg}")
+        print(f"       cap_luc={issued_str} | thay_doi_lan_cuoi={last_str}")
+PYEOF
+}
+
+preview_device_token_selection() {
+    local idx_csv="$1"
+    python3 - "$DEVICE_TOKENS_FILE" "$idx_csv" << 'PYEOF'
+import sys, json
+path, idx_csv = sys.argv[1], sys.argv[2]
+try:
+    with open(path) as f:
+        devices = json.load(f).get("devices", {})
+except Exception:
+    devices = {}
+if not devices:
+    print("ERROR:empty")
+    sys.exit(1)
+items = sorted(devices.items(), key=lambda kv: kv[1].get("last_seen", 0), reverse=True)
+if idx_csv.strip().lower() == "all":
+    selected = set(range(1, len(items) + 1))
+else:
+    selected = set()
+    for part in idx_csv.replace(" ", ",").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if not part.isdigit():
+            print(f"ERROR:invalid_index:{part}")
+            sys.exit(1)
+        selected.add(int(part))
+invalid = [i for i in selected if i < 1 or i > len(items)]
+if invalid:
+    print(f"ERROR:invalid_index:{','.join(map(str, sorted(invalid)))}")
+    sys.exit(1)
+if not selected:
+    print("ERROR:no_selection")
+    sys.exit(1)
+for i, (device_id, info) in enumerate(items, 1):
+    mark = "[x]" if i in selected else "[ ]"
+    print(f"{mark} {i}) device_id={device_id} (pkg={info.get('pkg', '?')})")
+print(f"COUNT:{len(selected)}")
+PYEOF
+}
+
+revoke_device_tokens_by_indices() {
+    local idx_csv="$1"
+    python3 - "$DEVICE_TOKENS_FILE" "$idx_csv" << 'PYEOF'
+import sys, json, os
+path, idx_csv = sys.argv[1], sys.argv[2]
+try:
+    with open(path) as f:
+        doc = json.load(f)
+except Exception:
+    print("ERROR:file_not_found")
+    sys.exit(1)
+devices = doc.get("devices", {})
+items = sorted(devices.items(), key=lambda kv: kv[1].get("last_seen", 0), reverse=True)
+if idx_csv.strip().lower() == "all":
+    indices = set(range(1, len(items) + 1))
+else:
+    indices = set()
+    for part in idx_csv.replace(" ", ",").split(","):
+        part = part.strip()
+        if part:
+            indices.add(int(part))
+invalid = [i for i in indices if i < 1 or i > len(items)]
+if invalid:
+    print(f"ERROR:invalid_index:{','.join(map(str, sorted(invalid)))}")
+    sys.exit(1)
+if not indices:
+    print("ERROR:no_selection")
+    sys.exit(1)
+removed = []
+for i in indices:
+    device_id = items[i - 1][0]
+    removed.append(device_id)
+    devices.pop(device_id, None)
+tmp = path + ".tmp"
+with open(tmp, "w") as f:
+    json.dump(doc, f, indent=2)
+os.replace(tmp, path)
+print("REMOVED:" + "|".join(removed))
+print(f"COUNT:{len(removed)}")
+PYEOF
+}
+
+device_token_menu() {
+    while true; do
+        show_submenu_header "🔑 QUẢN LÝ DEVICE TOKEN (token riêng từng máy, /api/config + /api/resolve)"
+        echo -e "${YELLOW}Mỗi máy sau khi qua được vé Key Attestation thật lần đầu sẽ${NC}"
+        echo -e "${YELLOW}được server tự cấp 1 token ngẫu nhiên RIÊNG (KHÔNG tính lại${NC}"
+        echo -e "${YELLOW}được từ APK như token tĩnh/cachedPass) — dùng cho các lần${NC}"
+        echo -e "${YELLOW}gọi /api/config, /api/resolve... sau đó. Thu hồi ở đây bắt${NC}"
+        echo -e "${YELLOW}buộc máy đó phải bootstrap lại bằng token tĩnh + vé thật.${NC}"
+        echo -e "${YELLOW}Đổi TOKEN (menu 'ĐỔI TOKEN') sẽ TỰ ĐỘNG xoá sạch bảng này.${NC}"
+        echo ""
+        list_device_tokens
+        echo ""
+        echo -e "  ${CYAN}[1]${NC}  ${YELLOW}THU HỒI (CÓ THỂ CHỌN NHIỀU)${NC}"
+        echo -e "  ${CYAN}[2]${NC}  ${WHITE}QUAY LẠI${NC}"
+        echo ""
+        read -p "Chon [1-2]: " DT_CHOICE
+        echo ""
+        case "$DT_CHOICE" in
+            1)
+                echo -e "${YELLOW}Nhap cac so muon thu hoi, cach nhau boi dau phay hoac khoang trang (vd: 1,3,5).${NC}"
+                echo -e "${YELLOW}Go 'all' de thu hoi tat ca. Enter de huy.${NC}"
+                read -p "Chon: " DT_IDX
+                if [ -n "$DT_IDX" ]; then
+                    DT_PREVIEW=$(preview_device_token_selection "$DT_IDX")
+                    if [[ "$DT_PREVIEW" == ERROR:empty* ]]; then
+                        echo -e "${RED}Danh sach dang trong.${NC}"
+                    elif [[ "$DT_PREVIEW" == ERROR:invalid_index* ]]; then
+                        echo -e "${RED}So thu tu khong hop le: ${DT_PREVIEW#ERROR:invalid_index:}${NC}"
+                    elif [[ "$DT_PREVIEW" == ERROR:no_selection* ]]; then
+                        echo -e "${RED}Chua chon muc nao.${NC}"
+                    else
+                        echo ""
+                        echo -e "${CYAN}${BOLD}Danh sach da chon thu hoi:${NC}"
+                        echo "$DT_PREVIEW" | grep -v "^COUNT:"
+                        DT_SEL_COUNT=$(echo "$DT_PREVIEW" | grep "^COUNT:" | cut -d: -f2)
+                        echo ""
+                        echo -e "${YELLOW}Sau khi thu hoi, may tuong ung phai bootstrap lai bang token${NC}"
+                        echo -e "${YELLOW}tinh + ve attestation that o lan goi /api/config ke tiep.${NC}"
+                        read -p "Xac nhan thu hoi $DT_SEL_COUNT muc da chon? [y/N]: " DT_CONFIRM
+                        if [[ "$DT_CONFIRM" == "y" || "$DT_CONFIRM" == "Y" ]]; then
+                            DT_RM_RESULT=$(revoke_device_tokens_by_indices "$DT_IDX")
+                            chmod 600 "$DEVICE_TOKENS_FILE" 2>/dev/null || true
+                            chown www-data:www-data "$DEVICE_TOKENS_FILE" 2>/dev/null || true
+                            if [[ "$DT_RM_RESULT" == *"REMOVED:"* ]]; then
+                                DT_RM_COUNT=$(echo "$DT_RM_RESULT" | grep "^COUNT:" | cut -d: -f2)
+                                echo -e "${GREEN}✅ Da thu hoi $DT_RM_COUNT token.${NC}"
+                            else
+                                echo -e "${RED}Loi: $DT_RM_RESULT${NC}"
+                            fi
+                        else
+                            echo -e "${YELLOW}Da huy.${NC}"
+                        fi
+                    fi
+                fi
+                ;;
+            2)
+                return
+                ;;
+            *)
+                echo -e "${RED}Lua chon khong hop le.${NC}"
+                ;;
+        esac
+        echo ""
+    done
+}
+
 uninstall_all() {
     echo -e "${RED}${BOLD}GỠ CÀI ĐẶT MTUNNEL LICENSE SERVER${NC}"
     echo -e "${BLUE}─────────────────────────────────────────────────${NC}"
@@ -1774,12 +1949,13 @@ while true; do
     echo -e "  ${CYAN}[10]${NC} ${YELLOW}CẤU HÌNH GITHUB CHO /API/CONFIG${NC} (owner/repo/branch/path/token)"
     echo -e "  ${CYAN}[11]${NC} ${YELLOW}ĐỔI PORT HTTPS${NC}"
     echo -e "  ${CYAN}[12]${NC} ${YELLOW}QUẢN LÝ DNS ẢO${NC} (bảng server_id -> IP thật cho /api/resolve)"
+    echo -e "  ${CYAN}[13]${NC} ${YELLOW}QUẢN LÝ DEVICE TOKEN${NC} (token riêng từng máy, xem/thu hồi)"
     echo -e "${BLUE}  ─────────────────────────────────────────────────${NC}"
-    echo -e "  ${CYAN}[13]${NC} ${YELLOW}CẬP NHẬT PANEL TỪ GITHUB${NC} (bản mới nhất)"
-    echo -e "  ${CYAN}[14]${NC} ${RED}GỠ CÀI ĐẶT${NC} (xoá toàn bộ MTunnel License Server)"
-    echo -e "  ${CYAN}[15]${NC} ${WHITE}THOÁT${NC}"
+    echo -e "  ${CYAN}[14]${NC} ${YELLOW}CẬP NHẬT PANEL TỪ GITHUB${NC} (bản mới nhất)"
+    echo -e "  ${CYAN}[15]${NC} ${RED}GỠ CÀI ĐẶT${NC} (xoá toàn bộ MTunnel License Server)"
+    echo -e "  ${CYAN}[16]${NC} ${WHITE}THOÁT${NC}"
     echo ""
-    read -p "Nhap lua chon [1-15]: " CHOICE
+    read -p "Nhap lua chon [1-16]: " CHOICE
     echo ""
 
     case "$CHOICE" in
@@ -1851,12 +2027,15 @@ while true; do
             dns_resolve_menu
             ;;
         13)
-            update_panel_from_github
+            device_token_menu
             ;;
         14)
-            uninstall_all
+            update_panel_from_github
             ;;
         15)
+            uninstall_all
+            ;;
+        16)
             echo "Tam biet."
             exit 0
             ;;
