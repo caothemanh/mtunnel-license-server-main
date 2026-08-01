@@ -54,10 +54,16 @@ _resolve_servers_lock = threading.Lock()
 # tag 709), do system_server/Keystore điền, KHÔNG đi qua tiến trình app nên
 # không bị xhook/"Kill Signature Verification" (MT Manager) đánh lừa được.
 ATTESTATION_SIGNING_HASHES_FILE = os.path.join(INSTALL_DIR, ".attestation_signing_hashes.json")
+# Danh sach hash DEX build hop le — tinh boi compute_dex_hash.py tren may
+# build SAU KHI ky APK release. Format: {"allowed": ["<sha256 hex>", ...]}.
+# Trong luc rollout ban moi, giu CA hash ban cu va ban moi trong "allowed"
+# cho toi khi user cu da update het, roi moi xoa hash ban cu di.
+DEX_HASHES_FILE = os.path.join(INSTALL_DIR, ".dex_hashes.json")
 
 
 CACHE_TTL        = 3600
 GITHUB_FETCH_TTL = 60
+DEX_NONCE_TTL               = 60
 ATTESTATION_NONCE_TTL       = 60
 ATTESTATION_ROOT_CACHE_TTL  = 86400   # 24h — danh sách root Google ít khi đổi
                                         # (nhưng CÓ đổi, như đợt rotate 4/2026,
@@ -81,6 +87,8 @@ ATTESTATION_STATUS_CACHE_TTL = 3600   # 1h — danh sách này cập nhật khá
 
 _attestation_nonces = {}
 _attestation_nonce_lock = threading.Lock()
+_dex_nonces = {}
+_dex_nonce_lock = threading.Lock()
 
 _attestation_roots_cache = {"certs": [], "fetched_at": 0}
 _attestation_roots_lock = threading.Lock()
@@ -328,6 +336,18 @@ def _load_allowed_signing_hashes():
     """
     try:
         with open(ATTESTATION_SIGNING_HASHES_FILE, "r") as f:
+            return set(h.lower() for h in json.load(f).get("allowed", []))
+    except:
+        return set()
+
+
+def _load_allowed_dex_hashes():
+    """
+    File .dex_hashes.json: {"allowed": ["<combined sha256 hex>", ...]}
+    Tinh bang compute_dex_hash.py (xem file do) tren APK release da ky.
+    """
+    try:
+        with open(DEX_HASHES_FILE, "r") as f:
             return set(h.lower() for h in json.load(f).get("allowed", []))
     except:
         return set()
@@ -845,6 +865,95 @@ def attestation_verify():
         app.logger.warning(
             f"[attestation-verify] NOT_VERIFIED {ip} | pkg={pkg} | "
             f"boot_state={parsed['verified_boot_state']} | locked={parsed['device_locked']}")
+
+    return jsonify({
+        "result": base64.b64encode(message).decode(),
+        "signature": base64.b64encode(signature).decode(),
+    })
+
+
+@app.route("/api/dex-challenge", methods=["POST"])
+@limiter.limit("30 per minute")
+def dex_challenge():
+    """
+    Buoc 1/2 cua DEX integrity check (xem DexIntegrity.cpp ben client).
+    Request:  {"token": "...", "pkg": "..."}
+    Response: {"nonce": "<base64>", "expires_in": <giay>}
+    """
+    data = request.get_json(force=True, silent=True) or {}
+    token = data.get("token", "")
+    pkg = data.get("pkg", "")
+    ip = request.remote_addr
+
+    ok, reason = _check_auth(token, pkg)
+    if not ok:
+        app.logger.warning(f"[dex-challenge] DENIED {ip}: {reason}")
+        return jsonify({"error": reason}), 403
+
+    now = time.time()
+    with _dex_nonce_lock:
+        expired = [n for n, exp in _dex_nonces.items() if exp < now]
+        for n in expired:
+            del _dex_nonces[n]
+
+        nonce_bytes = os.urandom(32)
+        nonce_b64 = base64.b64encode(nonce_bytes).decode()
+        _dex_nonces[nonce_b64] = now + DEX_NONCE_TTL
+
+    return jsonify({"nonce": nonce_b64, "expires_in": DEX_NONCE_TTL})
+
+
+@app.route("/api/dex-verify", methods=["POST"])
+@limiter.limit("30 per minute")
+def dex_verify():
+    """
+    Buoc 2/2 cua DEX integrity check. Client gui lai dung "nonce" nhan tu
+    /api/dex-challenge kem dex_hash da tinh tren APK dang chay.
+    Request:  {"token": "...", "pkg": "...", "nonce": "...", "dex_hash": "<hex>"}
+    Response: {"result": "<base64 JSON da ky>", "signature": "<base64 Ed25519>"}
+
+    Payload da ky ben trong "result" gom {"valid", "nonce", "pkg", "dex_hash",
+    "ts"} — client (DexIntegrity::verify) BAT BUOC verify chu ky Ed25519
+    TRUOC KHI doc bat ky field nao, roi doi chieu lai dung "nonce" no vua
+    gui de chong replay response cu — nen 2 buoc do PHAI khop dinh dang nay.
+    """
+    data = request.get_json(force=True, silent=True) or {}
+    token = data.get("token", "")
+    pkg = data.get("pkg", "")
+    nonce = data.get("nonce", "")
+    dex_hash = data.get("dex_hash", "").strip().lower()
+    ip = request.remote_addr
+
+    ok, reason = _check_auth(token, pkg)
+    if not ok:
+        app.logger.warning(f"[dex-verify] AUTH FAILED {ip}: {reason}")
+        return jsonify({"error": reason}), 403
+
+    with _dex_nonce_lock:
+        expire_at = _dex_nonces.pop(nonce, None)
+    if expire_at is None or expire_at < time.time():
+        app.logger.warning(f"[dex-verify] REJECT {ip}: bad_or_expired_nonce")
+        return jsonify({"error": "bad_or_expired_nonce"}), 400
+
+    allowed_hashes = _load_allowed_dex_hashes()
+    is_valid = bool(dex_hash) and bool(allowed_hashes) and dex_hash in allowed_hashes
+
+    if is_valid:
+        app.logger.info(f"[dex-verify] OK {ip} | pkg={pkg} | dex_hash={dex_hash[:12]}...")
+    else:
+        app.logger.warning(
+            f"[dex-verify] MISMATCH {ip} | pkg={pkg} | dex_hash={dex_hash[:12]}... "
+            f"| allowed_count={len(allowed_hashes)}")
+
+    result_payload = {
+        "valid": is_valid,
+        "nonce": nonce,
+        "pkg": pkg,
+        "dex_hash": dex_hash,
+        "ts": int(time.time()),
+    }
+    message = json.dumps(result_payload, sort_keys=True, separators=(",", ":")).encode()
+    signature = SIGNING_KEY.sign(message)
 
     return jsonify({
         "result": base64.b64encode(message).decode(),
