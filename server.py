@@ -168,6 +168,41 @@ def _read_token():
     except:
         return ""
 
+def _build_config_with_resolve_map(base_config_bytes):
+    """
+    Nhúng bảng domain ảo -> IP thật (RESOLVE_SERVERS_FILE, CHỈ các mục đang
+    BẬT) thẳng vào trong config trả về mỗi lần /api/config, dưới field
+    "ResolveMap" — để app KHÔNG CẦN gọi /api/resolve "live" ngay lúc kết nối
+    tunnel nữa (lúc đó đòi hỏi internet+DNS phải hoạt động ĐÚNG khoảnh khắc
+    đó, dễ fail trên mạng 4G/ISP chặn DNS). App cache "ResolveMap" lại ngay
+    khi cập nhật config (lúc mạng chắc chắn tốt hơn), và tra thẳng từ cache
+    khi kết nối -> gần như tức thì, không phụ thuộc mạng tại thời điểm kết
+    nối. /api/resolve "live" vẫn giữ nguyên, chỉ còn dùng làm fallback cho
+    domain MỚI chưa kịp có trong cache (vd vừa thêm qua menu, máy chưa kịp
+    đồng bộ config lần nào).
+
+    Chạy lại ở MỌI request (không cache theo GITHUB_FETCH_TTL như
+    _get_config_bytes) vì admin có thể sửa bảng DNS ảo bất cứ lúc nào qua
+    menu, độc lập với việc config trên GitHub có đổi hay không.
+    """
+    try:
+        config_obj = json.loads(base_config_bytes.decode("utf-8"))
+    except Exception:
+        # Config không phải JSON hợp lệ (không nên xảy ra với config thật) —
+        # trả nguyên gốc, không thêm ResolveMap, tránh làm hỏng 1 config vốn
+        # dĩ vẫn dùng được.
+        return base_config_bytes
+
+    servers = _load_resolve_servers()
+    config_obj["ResolveMap"] = {
+        server_id: {"ip": info.get("ip", ""), "port": info.get("port", 443)}
+        for server_id, info in servers.items()
+        if info.get("enabled", True) and info.get("ip")
+    }
+
+    return json.dumps(config_obj).encode("utf-8")
+
+
 def _get_package():
     try:
         with open(CONFIG_FILE, "r") as f:
@@ -1397,6 +1432,10 @@ def get_config():
     if config_bytes is None:
         app.logger.error("[config] Khong co config nao kha dung (GitHub loi + chua co cache local)")
         return jsonify({"error": "config_unavailable"}), 500
+
+    # Nhúng ResolveMap TRƯỚC KHI ký — client cache lại để tra domain ảo lúc
+    # kết nối mà không cần gọi /api/resolve "live" (xem _build_config_with_resolve_map).
+    config_bytes = _build_config_with_resolve_map(config_bytes)
 
     signature = SIGNING_KEY.sign(config_bytes)
 
