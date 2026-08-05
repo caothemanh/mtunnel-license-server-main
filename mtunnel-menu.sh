@@ -1374,14 +1374,16 @@ if not servers:
 else:
     items = sorted(servers.items(), key=lambda kv: kv[0])
     for i, (server_id, info) in enumerate(items, 1):
-        ip = info.get("ip", "?")
+        ttype = info.get("type", "ip")
+        target = info.get("domain", "") if ttype == "domain" else info.get("ip", "?")
+        kind = "DOMAIN" if ttype == "domain" else "IP"
         port = info.get("port", "?")
         note = info.get("note", "")
         enabled = info.get("enabled", True)
         updated_at = info.get("updated_at", 0)
         updated_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(updated_at)) if updated_at else "?"
         state = "BAT" if enabled else "TAT"
-        print(f"  {i}) {server_id}  ->  {ip}:{port}  [{state}]")
+        print(f"  {i}) {server_id}  ->  {target}:{port}  [{kind}] [{state}]")
         if note:
             print(f"       ghi_chu={note} | cap_nhat_luc={updated_str}")
         else:
@@ -1390,23 +1392,33 @@ PYEOF
 }
 
 save_resolve_server() {
-    local server_id="$1" ip="$2" port="$3" note="$4" enabled="$5"
-    python3 - "$RESOLVE_SERVERS_FILE" "$server_id" "$ip" "$port" "$note" "$enabled" << 'PYEOF'
+    # type: "ip" hoac "domain". Khi "domain", target duoc luu vao key "domain"
+    # (client se tu resolve DNS binh thuong), key "ip" de trong de tuong thich
+    # nguoc voi client cu chi doc key "ip".
+    local server_id="$1" target="$2" port="$3" note="$4" enabled="$5" type="${6:-ip}"
+    python3 - "$RESOLVE_SERVERS_FILE" "$server_id" "$target" "$port" "$note" "$enabled" "$type" << 'PYEOF'
 import sys, json, os, time
-path, server_id, ip, port, note, enabled = sys.argv[1:7]
+path, server_id, target, port, note, enabled, ttype = sys.argv[1:8]
 try:
     with open(path) as f:
         doc = json.load(f)
 except Exception:
     doc = {"servers": {}}
 servers = doc.setdefault("servers", {})
-servers[server_id] = {
-    "ip": ip,
+entry = {
+    "type": ttype,
     "port": int(port) if port.isdigit() else 443,
     "note": note,
     "enabled": enabled == "1",
     "updated_at": int(time.time()),
 }
+if ttype == "domain":
+    entry["domain"] = target
+    entry["ip"] = ""
+else:
+    entry["ip"] = target
+    entry["domain"] = ""
+servers[server_id] = entry
 tmp = path + ".tmp"
 with open(tmp, "w") as f:
     json.dump(doc, f, indent=2)
@@ -1576,17 +1588,27 @@ dns_resolve_menu() {
                 if [ -z "$DNS_SID" ]; then
                     echo -e "${YELLOW}Da huy.${NC}"
                 else
-                    read -p "IP that phia sau (vd: 103.173.66.47): " DNS_IP
-                    if ! [[ "$DNS_IP" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
-                        echo -e "${RED}IP khong hop le.${NC}"
+                    read -p "IP that HOAC domain that phia sau (vd: 103.173.66.47 hoac abc.example.com): " DNS_IP
+                    DNS_TYPE=""
+                    if [[ "$DNS_IP" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+                        DNS_TYPE="ip"
+                    elif [[ "$DNS_IP" =~ ^([a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,63}$ ]]; then
+                        DNS_TYPE="domain"
+                    fi
+                    if [ -z "$DNS_TYPE" ]; then
+                        echo -e "${RED}Khong hop le (phai la IP hoac domain that, vd 103.173.66.47 hoac abc.example.com).${NC}"
                     else
                         read -p "Port (Enter = 443): " DNS_PORT
                         DNS_PORT=${DNS_PORT:-443}
                         read -p "Ghi chu (Enter = bo trong): " DNS_NOTE
-                        save_resolve_server "$DNS_SID" "$DNS_IP" "$DNS_PORT" "$DNS_NOTE" "1" > /dev/null
+                        save_resolve_server "$DNS_SID" "$DNS_IP" "$DNS_PORT" "$DNS_NOTE" "1" "$DNS_TYPE" > /dev/null
                         chmod 600 "$RESOLVE_SERVERS_FILE" 2>/dev/null || true
                         chown www-data:www-data "$RESOLVE_SERVERS_FILE" 2>/dev/null || true
-                        echo -e "${GREEN}✅ Da them/cap nhat $DNS_SID -> $DNS_IP:$DNS_PORT${NC}"
+                        if [ "$DNS_TYPE" = "domain" ]; then
+                            echo -e "${GREEN}✅ Da them/cap nhat $DNS_SID -> $DNS_IP:$DNS_PORT [DOMAIN, client se tu resolve DNS]${NC}"
+                        else
+                            echo -e "${GREEN}✅ Da them/cap nhat $DNS_SID -> $DNS_IP:$DNS_PORT [IP]${NC}"
+                        fi
                     fi
                 fi
                 ;;
@@ -1607,7 +1629,9 @@ if idx < 1 or idx > len(items):
     print("")
 else:
     sid, info = items[idx - 1]
-    print(f"{sid}|{info.get('ip', '')}|{info.get('port', 443)}|{info.get('note', '')}")
+    ttype = info.get('type', 'ip')
+    target = info.get('domain', '') if ttype == 'domain' else info.get('ip', '')
+    print(f"{sid}|{target}|{info.get('port', 443)}|{info.get('note', '')}|{ttype}")
 PYEOF
 )
                     if [ -z "$DNS_CURRENT" ]; then
@@ -1617,20 +1641,27 @@ PYEOF
                         DNS_OLD_IP=$(echo "$DNS_CURRENT" | cut -d'|' -f2)
                         DNS_OLD_PORT=$(echo "$DNS_CURRENT" | cut -d'|' -f3)
                         DNS_OLD_NOTE=$(echo "$DNS_CURRENT" | cut -d'|' -f4)
-                        echo -e "${YELLOW}Dang sua: $DNS_SID (hien tai: $DNS_OLD_IP:$DNS_OLD_PORT, ghi_chu=\"$DNS_OLD_NOTE\")${NC}"
-                        read -p "IP moi (Enter = giu nguyen $DNS_OLD_IP): " DNS_IP
+                        DNS_OLD_TYPE=$(echo "$DNS_CURRENT" | cut -d'|' -f5)
+                        echo -e "${YELLOW}Dang sua: $DNS_SID (hien tai: $DNS_OLD_IP:$DNS_OLD_PORT [$DNS_OLD_TYPE], ghi_chu=\"$DNS_OLD_NOTE\")${NC}"
+                        read -p "IP/domain moi (Enter = giu nguyen $DNS_OLD_IP): " DNS_IP
                         DNS_IP=${DNS_IP:-$DNS_OLD_IP}
                         read -p "Port moi (Enter = giu nguyen $DNS_OLD_PORT): " DNS_PORT
                         DNS_PORT=${DNS_PORT:-$DNS_OLD_PORT}
                         read -p "Ghi chu moi (Enter = giu nguyen): " DNS_NOTE
                         DNS_NOTE=${DNS_NOTE:-$DNS_OLD_NOTE}
-                        if ! [[ "$DNS_IP" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
-                            echo -e "${RED}IP khong hop le.${NC}"
+                        DNS_TYPE=""
+                        if [[ "$DNS_IP" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+                            DNS_TYPE="ip"
+                        elif [[ "$DNS_IP" =~ ^([a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,63}$ ]]; then
+                            DNS_TYPE="domain"
+                        fi
+                        if [ -z "$DNS_TYPE" ]; then
+                            echo -e "${RED}Khong hop le (phai la IP hoac domain that).${NC}"
                         else
-                            save_resolve_server "$DNS_SID" "$DNS_IP" "$DNS_PORT" "$DNS_NOTE" "1" > /dev/null
+                            save_resolve_server "$DNS_SID" "$DNS_IP" "$DNS_PORT" "$DNS_NOTE" "1" "$DNS_TYPE" > /dev/null
                             chmod 600 "$RESOLVE_SERVERS_FILE" 2>/dev/null || true
                             chown www-data:www-data "$RESOLVE_SERVERS_FILE" 2>/dev/null || true
-                            echo -e "${GREEN}✅ Da cap nhat $DNS_SID -> $DNS_IP:$DNS_PORT${NC}"
+                            echo -e "${GREEN}✅ Da cap nhat $DNS_SID -> $DNS_IP:$DNS_PORT [$DNS_TYPE]${NC}"
                         fi
                     fi
                 elif [ -n "$DNS_IDX" ]; then

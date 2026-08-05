@@ -195,9 +195,19 @@ def _build_config_with_resolve_map(base_config_bytes):
 
     servers = _load_resolve_servers()
     config_obj["ResolveMap"] = {
-        server_id: {"ip": info.get("ip", ""), "port": info.get("port", 443)}
+        server_id: {
+            # "type": "ip"  -> client dung thang gia tri "ip" (khong qua DNS).
+            # "type": "domain" -> client tu resolve "domain" bang DNS he thong
+            # (Google DNS / DNS cua mang) nhu 1 domain that binh thuong, vi
+            # domain nay co the tro toi Cloudflare/CDN/domain fronting v.v.,
+            # khong nen "dong cung" IP vao config (IP co the doi).
+            "type": info.get("type", "ip"),
+            "ip": info.get("ip", ""),
+            "domain": info.get("domain", ""),
+            "port": info.get("port", 443),
+        }
         for server_id, info in servers.items()
-        if info.get("enabled", True) and info.get("ip")
+        if info.get("enabled", True) and (info.get("ip") or info.get("domain"))
     }
 
     return json.dumps(config_obj).encode("utf-8")
@@ -1519,7 +1529,9 @@ def resolve():
 
     response = {
         "server_id": server_id,
-        "ip": entry["ip"],
+        "type": entry.get("type", "ip"),
+        "ip": entry.get("ip", ""),
+        "domain": entry.get("domain", ""),
         "port": entry.get("port"),
         "expires_in": CACHE_TTL,
     }
@@ -1530,7 +1542,8 @@ def resolve():
     if device_id and auth_method != "device_token":
         response["new_token"] = _issue_device_token(device_id, pkg)
 
-    app.logger.info(f"[resolve] served {server_id} -> {entry['ip']} to {ip}")
+    _target_log = entry.get("domain") or entry.get("ip", "")
+    app.logger.info(f"[resolve] served {server_id} -> {_target_log} to {ip}")
     return jsonify(response)
 
 
